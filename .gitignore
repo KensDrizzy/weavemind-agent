@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# WeaveMind 运行时
+.weavemind/
+
+# 敏感配置（含 API Key）
+config.yaml
+
+# Java 构建产物
+spring-boot-hello/target/
+*.class
+*.jar
+*.war
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 测试和临时文件
+test_lqf/
+test1111/
+demo0507/demo.zip
+
+# Claude Code 会话文件
+.claude/
+
+# Firecrawl 缓存
+.firecrawl/
+
+# pip install 残留
+=0.3.0

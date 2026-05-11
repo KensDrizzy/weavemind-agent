@@ -1,0 +1,11 @@
+#!/bin/bash
+# WeaveMindAgent CLI launcher
+# This script allows you to run 'weavemind' from any directory
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Activate virtual environment and run main.py
+source "$SCRIPT_DIR/.venv/bin/activate"
+cd "$SCRIPT_DIR"
+python main.py

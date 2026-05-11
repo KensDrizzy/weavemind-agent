@@ -1,0 +1,228 @@
+"""DAG 执行引擎 — 按拓扑序执行 Plan 中的任务，支持并行和失败处理。
+
+复用现有 ToolRegistry、PermissionPolicy、HookManager 基础设施。
+"""
+
+import asyncio
+import inspect
+import logging
+from typing import Optional
+
+from core.plan_models import Plan, Task, TaskStatus, PlanStatus
+from tools.registry import ToolRegistry
+from permissions.policy import PermissionPolicy
+from hooks.manager import HookManager
+
+logger = logging.getLogger(__name__)
+
+
+class PlanExecutionError(Exception):
+    """计划执行过程中的错误。"""
+    pass
+
+
+class PlanExecutor:
+    """DAG 执行引擎。
+
+    每轮取所有 PENDING 且依赖已满足的任务并行执行。
+    单任务流程：权限检查 → PreToolUse Hook → 工具调用 → PostToolUse Hook → 状态更新。
+    """
+
+    def __init__(
+        self,
+        tool_registry: ToolRegistry,
+        permission_policy: PermissionPolicy,
+        hook_manager: Optional[HookManager] = None,
+        max_parallel: int = 4,
+    ):
+        self.tool_registry = tool_registry
+        self.permission_policy = permission_policy
+        self.hook_manager = hook_manager
+        self.max_parallel = max_parallel
+        # 兼容规划器生成的常见参数别名（如 file_path -> path）
+        self.arg_aliases = {
+            "path": {"file_path", "filepath", "file", "target_path"},
+            "content": {"text", "body", "file_content"},
+            "old_string": {"old", "old_text", "before"},
+            "new_string": {"new", "new_text", "after"},
+            "command": {"cmd", "shell", "script"},
+            "url": {"link", "uri"},
+            "query": {"keyword"},
+            "root": {"dir", "directory"},
+        }
+
+    def execute(self, plan: Plan) -> Plan:
+        """同步执行计划（内部使用 asyncio 实现并行）。"""
+        plan.status = PlanStatus.RUNNING
+        logger.info(f"开始执行计划 {plan.id}: {plan.goal}")
+
+        try:
+            asyncio.run(self._execute_plan_async(plan))
+        except RuntimeError as e:
+            if "Event loop is already running" in str(e):
+                # 在已有事件循环中（如 Jupyter），使用 nest_asyncio 或回退到串行
+                self._execute_plan_serial(plan)
+            else:
+                raise
+
+        return plan
+
+    async def _execute_plan_async(self, plan: Plan):
+        """异步并行执行计划。"""
+        while not plan.is_finished():
+            ready = plan.ready_tasks()
+            if not ready:
+                # 无就绪任务但计划未结束 → 存在不可达任务
+                self._mark_unreachable(plan)
+                break
+
+            # 限制并行度
+            batch = ready[:self.max_parallel]
+            tasks_coros = [self._execute_task_async(t, plan) for t in batch]
+            await asyncio.gather(*tasks_coros)
+
+        self._finalize_plan(plan)
+
+    def _execute_plan_serial(self, plan: Plan):
+        """串行执行计划（回退方案）。"""
+        while not plan.is_finished():
+            ready = plan.ready_tasks()
+            if not ready:
+                self._mark_unreachable(plan)
+                break
+
+            for task in ready:
+                self._execute_task(task, plan)
+
+        self._finalize_plan(plan)
+
+    async def _execute_task_async(self, task: Task, plan: Plan):
+        """异步执行单个任务。"""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._execute_task, task, plan)
+
+    def _execute_task(self, task: Task, plan: Plan):
+        """执行单个任务：权限检查 → Hook → 工具调用 → Hook → 更新状态。"""
+        task.mark_started()
+        logger.info(f"执行任务 {task.id}: {task.description}")
+
+        try:
+            # 无工具名时，由 LLM 自由执行（后续迭代支持）
+            if not task.tool_name:
+                task.mark_completed(result="未指定工具，跳过执行")
+                return
+
+            # 权限检查
+            allowed = self.permission_policy.is_allowed(task.tool_name)
+            if not allowed:
+                task.mark_failed(error=f"工具 {task.tool_name} 被权限策略拒绝")
+                self._propagate_failure(task, plan)
+                return
+
+            tool = self.tool_registry.get(task.tool_name)
+            if not tool:
+                task.mark_failed(error=f"工具 {task.tool_name} 不存在")
+                self._propagate_failure(task, plan)
+                return
+
+            # 构建工具输入
+            tool_input = self._normalize_tool_args(tool, task.tool_args or {})
+
+            # PreToolUse Hook
+            if self.hook_manager:
+                self.hook_manager.emit("PreToolUse", {
+                    "tool": task.tool_name,
+                    "args": tool_input,
+                    "task_id": task.id,
+                })
+
+            result = tool.invoke(tool_input)
+
+            # PostToolUse Hook
+            if self.hook_manager:
+                self.hook_manager.emit("PostToolUse", {
+                    "tool": task.tool_name,
+                    "args": tool_input,
+                    "task_id": task.id,
+                    "result": str(result)[:500],
+                })
+
+            task.mark_completed(result=str(result))
+            logger.info(f"任务 {task.id} 完成")
+
+        except Exception as e:
+            logger.error(f"任务 {task.id} 执行失败: {e}")
+            task.mark_failed(error=str(e))
+            self._propagate_failure(task, plan)
+
+    def _normalize_tool_args(self, tool, tool_args: dict) -> dict:
+        """按工具 _run 签名规范化参数，兼容常见别名并过滤无效参数。"""
+        if not tool_args:
+            return {}
+
+        run_fn = getattr(tool, "_run", None)
+        if run_fn is None:
+            # 测试替身等无 _run 签名时，不做约束
+            return dict(tool_args)
+
+        try:
+            sig = inspect.signature(run_fn)
+        except (TypeError, ValueError):
+            return dict(tool_args)
+
+        expected = {name for name in sig.parameters.keys() if name != "self"}
+        alias_to_canonical = {}
+        for canonical, aliases in self.arg_aliases.items():
+            for alias in aliases:
+                alias_to_canonical[alias] = canonical
+
+        normalized = {}
+        for key, value in tool_args.items():
+            if key in expected:
+                normalized[key] = value
+                continue
+
+            # 兼容 Glob 等将 path 作为 root 的情况
+            if key == "path" and "root" in expected and "path" not in expected and "root" not in normalized:
+                normalized["root"] = value
+                continue
+
+            canonical = alias_to_canonical.get(key)
+            if canonical and canonical in expected and canonical not in normalized:
+                normalized[canonical] = value
+                continue
+
+            logger.debug(
+                "任务参数被忽略: tool=%s, key=%s, expected=%s",
+                getattr(tool, "name", "unknown"),
+                key,
+                sorted(expected),
+            )
+
+        return normalized
+
+    def _propagate_failure(self, failed_task: Task, plan: Plan):
+        """将失败传播到依赖链上的所有任务。"""
+        failed_id = failed_task.id
+        for task in plan.tasks:
+            if task.status == TaskStatus.PENDING and failed_id in task.dependencies:
+                task.mark_skipped(reason=f"依赖任务 {failed_id} 失败")
+                # 递归传播
+                self._propagate_failure(task, plan)
+
+    def _mark_unreachable(self, plan: Plan):
+        """标记所有不可达的 PENDING 任务为 SKIPPED。"""
+        for task in plan.tasks:
+            if task.status == TaskStatus.PENDING:
+                task.mark_skipped(reason="不可达任务（可能依赖失败任务）")
+
+    def _finalize_plan(self, plan: Plan):
+        """根据任务执行结果确定计划最终状态。"""
+        if plan.has_failure():
+            plan.status = PlanStatus.FAILED
+        elif all(t.status == TaskStatus.COMPLETED for t in plan.tasks):
+            plan.status = PlanStatus.COMPLETED
+        else:
+            plan.status = PlanStatus.FAILED
+
+        logger.info(f"计划 {plan.id} 执行结束: {plan.status.value}")
