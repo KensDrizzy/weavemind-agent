@@ -1,35 +1,53 @@
-from tools.base import WeaveMindTool
-import httpx
+"""WebFetch 工具 — 抓取网页内容并提取正文。
+
+特性：
+- SSRF 防护（禁止内网地址、危险协议）
+- 域名级限流
+- HTML 正文提取（去除广告/导航等噪声）
+- 自动转 Markdown 格式
+"""
+
+import logging
+
+from langchain_core.tools import tool
+
+from web.fetcher.fetcher import WebFetcher
+
+logger = logging.getLogger(__name__)
+
+_fetcher = WebFetcher()
 
 
-class WebFetchTool(WeaveMindTool):
-    name: str = "WebFetch"
-    description: str = "Fetch and extract text from a URL. Args: url, prompt (optional)"
+@tool
+def WebFetch(url: str, extract_content: bool = True) -> str:
+    """抓取网页内容并提取正文。
 
-    def _run(self, url: str, prompt: str = "") -> str:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; WeaveMind/1.0)",
-        }
-        try:
-            resp = httpx.get(url, follow_redirects=True, timeout=30, headers=headers)
-            resp.raise_for_status()
-        except httpx.HTTPError as e:
-            # 部分站点存在 SSL 兼容问题，回退到 verify=False 尝试一次
-            if "ssl" not in str(e).lower():
-                raise RuntimeError(f"WebFetch 请求失败: {e}") from e
-            try:
-                resp = httpx.get(
-                    url,
-                    follow_redirects=True,
-                    timeout=30,
-                    headers=headers,
-                    verify=False,
-                )
-                resp.raise_for_status()
-            except httpx.HTTPError as e2:
-                raise RuntimeError(f"WebFetch 请求失败(SSL 回退后仍失败): {e2}") from e2
-        # Strip HTML tags minimally
-        import re
-        text = re.sub(r"<[^>]+>", " ", resp.text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text[:8000]
+    用于获取指定 URL 的网页内容。自动清理广告、导航等噪声，
+    提取正文并转为 Markdown 格式。
+
+    注意：
+    - 不支持需要登录的页面
+    - JS 渲染的 SPA 页面可能提取不到正文
+    - 被反爬保护的页面可能无法访问
+
+    Args:
+        url: 要抓取的网页 URL
+        extract_content: 是否提取正文（True=只返回正文，False=返回原始 HTML）
+    """
+    try:
+        result = _fetcher.fetch(url, extract_content=extract_content)
+    except RuntimeError as e:
+        return str(e)
+
+    title = result["title"]
+    content = result["content"]
+    final_url = result["url"]
+
+    parts = []
+    if title:
+        parts.append(f"# {title}\n")
+    if final_url != url:
+        parts.append(f"（重定向至: {final_url}）\n")
+    parts.append(content)
+
+    return "\n".join(parts)

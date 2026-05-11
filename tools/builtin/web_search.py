@@ -1,27 +1,52 @@
-from tools.base import WeaveMindTool
-import os
+"""WebSearch 工具 — 通过搜索引擎查询互联网信息。
+
+支持三种搜索引擎（自动检测优先级）：
+1. Tavily（需 API Key，AI 优化结果）
+2. SearXNG（自部署，聚合多引擎）
+3. DuckDuckGo（免费，无需配置）
+"""
+
+import logging
+from typing import Optional
+
+from langchain_core.tools import tool
+
+from web.models import SearchResult
+from web.providers.factory import SearchProviderFactory
+
+logger = logging.getLogger(__name__)
 
 
-class WebSearchTool(WeaveMindTool):
-    name: str = "WebSearch"
-    description: str = "Search the web via Tavily. Args: query"
+@tool
+def WebSearch(query: str, top_k: int = 5) -> str:
+    """搜索互联网获取最新信息。
 
-    def _run(self, query: str) -> str:
-        try:
-            from tavily import TavilyClient
-        except Exception as e:
-            raise RuntimeError("WebSearch 不可用：缺少 tavily-python 依赖") from e
+    当需要查找最新资讯、技术文档、API 用法、错误解决方案等时使用。
+    返回搜索结果列表，每条包含标题、链接和摘要。
 
-        api_key = os.environ.get("TAVILY_API_KEY")
-        if not api_key:
-            raise RuntimeError("WebSearch 不可用：未设置环境变量 TAVILY_API_KEY")
+    Args:
+        query: 搜索关键词，尽量具体以获得更好结果
+        top_k: 返回结果数量，默认 5
+    """
+    provider = SearchProviderFactory.create()
 
-        client = TavilyClient(api_key=api_key)
-        try:
-            results = client.search(query, max_results=5)
-        except Exception as e:
-            raise RuntimeError(f"WebSearch 请求失败: {e}") from e
-        return "\n\n".join(
-            f"[{r['title']}]({r['url']})\n{r['content']}"
-            for r in results.get("results", [])
-        )
+    if not provider.is_ready():
+        return provider.unavailable_hint()
+
+    try:
+        results: list[SearchResult] = provider.search(query, top_k)
+    except Exception as e:
+        logger.error("WebSearch 执行失败: %s", e)
+        return f"搜索失败: {e}"
+
+    if not results:
+        return f"未找到与 \"{query}\" 相关的结果"
+
+    # 格式化输出
+    lines = [f"搜索结果（{provider.name()}）:\n"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r.title}")
+        lines.append(f"   {r.url}")
+        lines.append(f"   {r.content}\n")
+
+    return "\n".join(lines)

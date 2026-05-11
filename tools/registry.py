@@ -9,8 +9,8 @@ from tools.builtin.edit import EditTool
 from tools.builtin.bash import BashTool
 from tools.builtin.glob import GlobTool
 from tools.builtin.grep import GrepTool
-from tools.builtin.web_search import WebSearchTool
-from tools.builtin.web_fetch import WebFetchTool
+from tools.builtin.web_search import WebSearch
+from tools.builtin.web_fetch import WebFetch
 from tools.builtin.ask_user import AskUserTool
 from tools.builtin.memory_tools import MemoryAddTool, MemorySearchTool, CoreMemoryEditTool
 from tools.builtin.rag_tools import SearchCodeTool, IndexWorkspaceTool
@@ -28,7 +28,7 @@ class ToolRegistry:
     def _register_builtins(self):
         # 将读取/检索类工具放在前面，降低简单查询时对 Bash 的误用概率。
         for tool in [
-            ReadTool(), GlobTool(), GrepTool(), WebFetchTool(), WebSearchTool(),
+            ReadTool(), GlobTool(), GrepTool(), WebFetch, WebSearch,
             AskUserTool(), EditTool(), WriteTool(), BashTool(),
             MemoryAddTool(memory_manager=self._memory_manager),
             MemorySearchTool(memory_manager=self._memory_manager),
