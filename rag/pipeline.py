@@ -91,6 +91,10 @@ class CodeRAGPipeline:
         )
         self._indexed_files: dict = {}  # file_path -> {hash, timestamp}
         self._load_metadata()
+        # 新鲜度配置
+        self._auto_refresh = settings.get("rag.auto_refresh", True)
+        self._stale_threshold = settings.get("rag.stale_threshold_seconds", 300)  # 5 分钟
+        self._last_refresh_time = 0.0  # 上次自动刷新时间
 
     # ── 索引 ──────────────────────────────────────────────
 
@@ -127,10 +131,13 @@ class CodeRAGPipeline:
         if not chunks:
             return 0
 
-        # 给每个 chunk 打上 source 标签
+        # 给每个 chunk 打上 source 标签和索引时间
         if source:
             for chunk in chunks:
                 chunk.source = source
+        now = time.time()
+        for chunk in chunks:
+            chunk.indexed_at = now
 
         # 写入向量存储
         self._add_to_vector_store(chunks)
@@ -306,6 +313,7 @@ class CodeRAGPipeline:
                 signature=meta.get("signature"),
                 language=meta.get("language", "python"),
                 source=meta.get("source"),
+                indexed_at=meta.get("indexed_at"),
             )
             results.append(
                 RetrievalResult(
@@ -515,3 +523,196 @@ class CodeRAGPipeline:
         os.makedirs(os.path.dirname(self._metadata_path), exist_ok=True)
         with open(self._metadata_path, "w", encoding="utf-8") as f:
             json.dump(self._indexed_files, f, ensure_ascii=False, indent=2)
+
+    # ── 新鲜度检测与自动刷新 ──────────────────────────────
+
+    def check_freshness(self, source_filter: str = None) -> dict:
+        """检测索引新鲜度，返回过期/已删除/新增文件统计。
+
+        Args:
+            source_filter: 只检查指定 source 的文件（如 "weavemind"）
+
+        Returns:
+            {
+                "stale_files": [文件路径列表],   # 内容已变更
+                "deleted_files": [文件路径列表],  # 文件已删除
+                "new_files": [文件路径列表],      # 新增未索引
+                "fresh_count": int,               # 未变更文件数
+                "total_indexed": int,             # 总已索引文件数
+            }
+        """
+        stale = []
+        deleted = []
+        fresh = 0
+
+        for cache_key, meta in list(self._indexed_files.items()):
+            # source 过滤
+            if source_filter:
+                # cache_key 格式: "source::./path" 或 "./path"
+                if not cache_key.startswith(f"{source_filter}::"):
+                    continue
+
+            # 提取实际文件路径
+            parts = cache_key.split("::", 1)
+            file_path = parts[1] if len(parts) > 1 else parts[0]
+
+            # 检查文件是否存在
+            if not os.path.exists(file_path):
+                deleted.append(cache_key)
+                continue
+
+            # 检查内容是否变更
+            current_hash = self._file_hash(file_path)
+            if current_hash and meta.get("hash") != current_hash:
+                stale.append(cache_key)
+            else:
+                fresh += 1
+
+        # 检测新增文件（仅当有 source_filter 时，扫描对应目录）
+        new_files = []
+        if source_filter:
+            new_files = self._find_new_files(source_filter)
+
+        return {
+            "stale_files": stale,
+            "deleted_files": deleted,
+            "new_files": new_files,
+            "fresh_count": fresh,
+            "total_indexed": len(self._indexed_files),
+        }
+
+    def _find_new_files(self, source: str) -> list:
+        """查找指定 source 下新增但未索引的文件。"""
+        # 从 metadata 中找到该 source 的索引根目录
+        source_dirs = set()
+        for cache_key, meta in self._indexed_files.items():
+            if cache_key.startswith(f"{source}::"):
+                parts = cache_key.split("::", 1)
+                file_path = parts[1] if len(parts) > 1 else parts[0]
+                # 向上推导出索引根目录
+                source_dirs.add(os.path.dirname(file_path))
+
+        # 如果找不到目录，尝试从 source 名推断
+        if not source_dirs:
+            if os.path.isdir(source):
+                source_dirs.add(source)
+
+        new_files = []
+        for base_dir in source_dirs:
+            # 向上找到项目根（包含 .weavemind 的目录）
+            search_dir = base_dir
+            for _ in range(5):
+                if os.path.exists(os.path.join(search_dir, ".weavemind")):
+                    break
+                parent = os.path.dirname(search_dir)
+                if parent == search_dir:
+                    break
+                search_dir = parent
+
+            if not os.path.isdir(search_dir):
+                continue
+
+            for root, dirs, files in os.walk(search_dir):
+                dirs[:] = [d for d in dirs if should_index_dir(os.path.join(root, d))]
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    if not should_index_file(fpath):
+                        continue
+                    cache_key = f"{source}::{fpath}"
+                    if cache_key not in self._indexed_files:
+                        new_files.append(fpath)
+
+        return new_files
+
+    def auto_refresh(self, source_filter: str = None) -> dict:
+        """自动检测并增量更新过期索引。
+
+        在 SearchCode 调用前自动触发，静默更新变更文件、清理已删除文件。
+        不会全量重建，只处理差异部分。
+
+        Returns:
+            {"updated": int, "deleted": int, "new_indexed": int, "skipped": int}
+        """
+        if not self._auto_refresh:
+            return {"updated": 0, "deleted": 0, "new_indexed": 0, "skipped": 0, "reason": "auto_refresh disabled"}
+
+        # 防止频繁扫描：距离上次刷新不足阈值时间则跳过
+        now = time.time()
+        if now - self._last_refresh_time < self._stale_threshold:
+            return {"updated": 0, "deleted": 0, "new_indexed": 0, "skipped": 0, "reason": "too soon"}
+        self._last_refresh_time = now
+
+        freshness = self.check_freshness(source_filter)
+        updated = 0
+        deleted_count = 0
+        new_indexed = 0
+
+        # 1. 更新内容变更的文件
+        for cache_key in freshness["stale_files"]:
+            parts = cache_key.split("::", 1)
+            file_path = parts[1] if len(parts) > 1 else parts[0]
+            source = parts[0] if len(parts) > 1 else None
+
+            if not os.path.exists(file_path):
+                continue
+            try:
+                n = self.index_file(file_path, source=source)
+                if n > 0:
+                    updated += 1
+                    logger.info(f"[auto_refresh] 更新: {file_path} → {n} 块")
+            except Exception as e:
+                logger.warning(f"[auto_refresh] 更新失败: {file_path}: {e}")
+
+        # 2. 清理已删除文件的向量
+        for cache_key in freshness["deleted_files"]:
+            parts = cache_key.split("::", 1)
+            file_path = parts[1] if len(parts) > 1 else parts[0]
+            try:
+                self._remove_file_vectors(file_path)
+                del self._indexed_files[cache_key]
+                deleted_count += 1
+                logger.info(f"[auto_refresh] 清理已删除: {file_path}")
+            except Exception as e:
+                logger.warning(f"[auto_refresh] 清理失败: {file_path}: {e}")
+
+        # 3. 索引新增文件
+        for file_path in freshness["new_files"]:
+            # 从路径推断 source
+            source = source_filter
+            try:
+                n = self.index_file(file_path, source=source)
+                if n > 0:
+                    new_indexed += 1
+                    logger.info(f"[auto_refresh] 新增: {file_path} → {n} 块")
+            except Exception as e:
+                logger.warning(f"[auto_refresh] 新增索引失败: {file_path}: {e}")
+
+        # 持久化 metadata
+        if updated > 0 or deleted_count > 0 or new_indexed > 0:
+            self._save_metadata()
+
+        result = {
+            "updated": updated,
+            "deleted": deleted_count,
+            "new_indexed": new_indexed,
+            "skipped": freshness["fresh_count"],
+        }
+        if updated > 0 or deleted_count > 0 or new_indexed > 0:
+            logger.info(f"[auto_refresh] 完成: 更新{updated} 清理{deleted_count} 新增{new_indexed}")
+        return result
+
+    def _remove_file_vectors(self, file_path: str):
+        """从向量存储中删除指定文件的所有文档。"""
+        try:
+            existing = self.vector_store.get(where={"file_path": file_path})
+            if existing and existing["ids"]:
+                self.vector_store.delete(ids=existing["ids"])
+                logger.debug(f"清理向量: {file_path} ({len(existing['ids'])} 条)")
+        except Exception as e:
+            logger.warning(f"清理向量失败: {file_path}: {e}")
+
+        # 同时清理关键词索引
+        try:
+            self.keyword_index.delete_by_file(file_path)
+        except Exception as e:
+            logger.warning(f"清理关键词索引失败: {file_path}: {e}")

@@ -25,6 +25,7 @@ class CodeChunk(BaseModel):
     docstring: Optional[str] = Field(default=None, description="文档字符串")
     language: str = Field(default="python", description="编程语言")
     source: Optional[str] = Field(default=None, description="索引源目录标签，用于区分不同项目")
+    indexed_at: Optional[float] = Field(default=None, description="索引时间戳（Unix epoch）")
 
     def to_metadata(self) -> dict:
         """转换为向量存储的 metadata 字典。"""
@@ -42,6 +43,8 @@ class CodeChunk(BaseModel):
             meta["parent_name"] = self.parent_name
         if self.signature:
             meta["signature"] = self.signature
+        if self.indexed_at:
+            meta["indexed_at"] = self.indexed_at
         return meta
 
     def display_name(self) -> str:
