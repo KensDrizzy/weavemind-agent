@@ -96,7 +96,7 @@ class WeaveMindCLI:
         # 创建命令补全器
         commands = [
             "/help", "/memory", "/save", "/sessions", "/mode", "/plan", "/team",
-            "/hitl", "/index", "/search", "/clear", "/exit", "/quit"
+            "/hitl", "/mcp", "/index", "/search", "/clear", "/exit", "/quit"
         ]
         completer = FuzzyCompleter(WordCompleter(commands, ignore_case=True))
         key_bindings = self._build_key_bindings()
@@ -266,7 +266,7 @@ class WeaveMindCLI:
 
                 # 斜杠命令
                 if user_input.startswith("/"):
-                    result = handle_command(user_input, self.agent_loop, self.session_manager, rag_pipeline=self.rag_pipeline)
+                    result = handle_command(user_input, self.agent_loop, self.session_manager, rag_pipeline=self.rag_pipeline, mcp_manager=self.mcp_manager)
 
                     if result == "plan_mode":
                         self.plan_mode = not self.plan_mode

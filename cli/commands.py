@@ -14,7 +14,7 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
-def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None) -> bool:
+def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None, mcp_manager=None) -> bool:
     """Returns True if command was handled, str for mode change, 'plan_mode' for /plan toggle."""
     parts = cmd.strip().split()
     name = parts[0].lower()
@@ -31,6 +31,7 @@ def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None) -> 
         help_table.add_row("/sessions", "列出所有保存的会话")
         help_table.add_row("/mode [MODE]", "切换权限模式 (default | acceptEdits | bypassPermissions)")
         help_table.add_row("/hitl [on|off|status]", "人工审批模式（默认启用，/hitl off 关闭）")
+        help_table.add_row("/mcp [status|tools|health]", "查看 MCP 连接状态、工具列表、健康检查")
         help_table.add_row("/plan", "切换 Plan-Execute 模式（复杂任务先规划后执行）")
         help_table.add_row("/team", "切换 Multi-Agent 模式（多角色分工+审查验收）")
         help_table.add_row("/clear", "清空屏幕")
@@ -87,6 +88,9 @@ def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None) -> 
 
     elif name == "/hitl":
         _handle_hitl(parts, agent_loop)
+
+    elif name == "/mcp":
+        _handle_mcp(parts, mcp_manager)
 
     elif name in ("/exit", "/quit"):
         raise SystemExit(0)
@@ -284,3 +288,162 @@ def _handle_hitl(parts: list, agent_loop):
         console.print("[dim]  on     启用人工审批[/dim]")
         console.print("[dim]  off    禁用人工审批[/dim]")
         console.print("[dim]  status 查看当前状态[/dim]\n")
+
+
+def _handle_mcp(parts: list, mcp_manager=None):
+    """处理 /mcp 命令 — 查看 MCP 连接状态、工具列表、健康检查。
+
+    用法:
+        /mcp           显示 MCP 总体状态
+        /mcp status    显示连接状态和工具数量
+        /mcp tools     显示所有 MCP 工具的详细列表
+        /mcp health    对所有 Server 执行健康检查（ping）
+    """
+    if not mcp_manager:
+        console.print("\n[red]❌ MCP Manager 未初始化[/red]")
+        console.print("[dim]请在 config.yaml 中设置 mcp.enabled: true 并配置 servers[/dim]\n")
+        return
+
+    subcmd = parts[1] if len(parts) > 1 else "status"
+
+    if subcmd == "status":
+        _show_mcp_status(mcp_manager)
+    elif subcmd == "tools":
+        _show_mcp_tools(mcp_manager)
+    elif subcmd == "health":
+        _show_mcp_health(mcp_manager)
+    else:
+        console.print("\n[yellow]用法: /mcp [status|tools|health][/yellow]")
+        console.print("[dim]  status  显示连接状态和工具数量[/dim]")
+        console.print("[dim]  tools   显示所有 MCP 工具的详细列表[/dim]")
+        console.print("[dim]  health  对所有 Server 执行健康检查[/dim]\n")
+
+
+def _show_mcp_status(mcp_manager):
+    """显示 MCP 总体状态。"""
+    initialized = mcp_manager.is_initialized()
+    tools_info = mcp_manager.get_tools_info()
+
+    # 总开关
+    mcp_enabled = settings.get("mcp.enabled", False)
+
+    status_table = Table(
+        title="📡 MCP 状态",
+        show_header=True,
+        header_style="bold cyan",
+    )
+    status_table.add_column("项目", style="cyan", width=12)
+    status_table.add_column("值", style="dim")
+
+    status_table.add_row("总开关", f"{'✅ 启用' if mcp_enabled else '❌ 禁用'}")
+    status_table.add_row("初始化", f"{'✅ 已完成' if initialized else '⏳ 未完成'}")
+    status_table.add_row("Server 数", str(len(tools_info)))
+
+    total_tools = sum(len(t) for t in tools_info.values())
+    status_table.add_row("工具总数", str(total_tools))
+
+    console.print()
+    console.print(status_table)
+
+    # 各 Server 状态
+    if tools_info:
+        server_table = Table(
+            title="Server 连接详情",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        server_table.add_column("Server", style="cyan")
+        server_table.add_column("状态", width=8)
+        server_table.add_column("工具数", width=6)
+        server_table.add_column("工具列表", style="dim")
+
+        for server_name, tool_names in tools_info.items():
+            conn = mcp_manager.get_connection(server_name)
+            connected = conn.is_connected() if conn else False
+            status_str = "✅ 连接" if connected else "❌ 断开"
+            tool_preview = ", ".join(tool_names[:5])
+            if len(tool_names) > 5:
+                tool_preview += f" ... (+{len(tool_names) - 5})"
+            server_table.add_row(server_name, status_str, str(len(tool_names)), tool_preview)
+
+        console.print(server_table)
+    else:
+        console.print("\n[dim]未连接任何 MCP Server[/dim]")
+
+    console.print()
+
+
+def _show_mcp_tools(mcp_manager):
+    """显示所有 MCP 工具的详细列表。"""
+    tools_info = mcp_manager.get_tools_info()
+
+    if not tools_info:
+        console.print("\n[dim]未连接任何 MCP Server，无可用 MCP 工具[/dim]\n")
+        return
+
+    for server_name, tool_names in tools_info.items():
+        conn = mcp_manager.get_connection(server_name)
+        if not conn:
+            continue
+
+        server_table = Table(
+            title=f"📡 {server_name} 工具列表",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        server_table.add_column("#", style="dim", width=3)
+        server_table.add_column("工具名", style="cyan")
+        server_table.add_column("描述", style="dim")
+
+        for i, tool_info in enumerate(conn.get_tools_info(), 1):
+            desc = tool_info.description or "(无描述)"
+            # 截断过长描述
+            if len(desc) > 80:
+                desc = desc[:80] + "..."
+            server_table.add_row(str(i), tool_info.name, desc)
+
+        console.print()
+        console.print(server_table)
+
+    console.print()
+
+
+def _show_mcp_health(mcp_manager):
+    """对所有 Server 执行健康检查。"""
+    if not mcp_manager.is_initialized():
+        console.print("\n[red]❌ MCP 未初始化，无法执行健康检查[/red]\n")
+        return
+
+    console.print("\n[cyan]🏥 正在检查 MCP Server 健康状态...[/cyan]")
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, mcp_manager.health_check())
+                results = future.result(timeout=15)
+        else:
+            results = asyncio.run(mcp_manager.health_check())
+    except Exception as e:
+        console.print(f"\n[red]❌ 健康检查失败: {e}[/red]\n")
+        return
+
+    health_table = Table(
+        title="🏥 MCP 健康检查结果",
+        show_header=True,
+        header_style="bold cyan",
+    )
+    health_table.add_column("Server", style="cyan")
+    health_table.add_column("状态", width=8)
+    health_table.add_column("详情", style="dim")
+
+    for server_name, healthy in results.items():
+        status_str = "✅ 正常" if healthy else "❌ 异常"
+        detail = "ping 成功" if healthy else "ping 失败或无响应"
+        health_table.add_row(server_name, status_str, detail)
+
+    console.print()
+    console.print(health_table)
+    console.print()

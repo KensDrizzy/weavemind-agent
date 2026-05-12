@@ -17,7 +17,7 @@ from typing import List, Optional
 
 import settings
 from langchain_core.documents import Document
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 
 from rag.models import CodeChunk, RetrievalResult, IndexStats
 from rag.chunkers import (
@@ -171,26 +171,46 @@ class CodeRAGPipeline:
         start_time = time.time()
         total_files = 0
         total_chunks = 0
+        skipped_files = 0
+        failed_files = 0
         chunks_by_type = {}
         chunks_by_lang = {}
 
+        # 第一遍：收集所有待索引文件
+        all_files = []
         for root, dirs, files in os.walk(dir_path):
-            # 跳过不需要的目录
             dirs[:] = [d for d in dirs if should_index_dir(os.path.join(root, d))]
-
             for fname in files:
-                if total_files >= max_files:
-                    logger.warning(f"达到最大索引文件数 {max_files}，停止索引")
-                    break
-
                 fpath = os.path.join(root, fname)
-                if not should_index_file(fpath):
-                    continue
+                if should_index_file(fpath):
+                    all_files.append(fpath)
 
+        total_candidates = len(all_files)
+        print(f"  发现 {total_candidates} 个可索引文件")
+
+        # 第二遍：逐文件索引 + 实时进度
+        for idx, fpath in enumerate(all_files, 1):
+            if total_files >= max_files:
+                logger.warning(f"达到最大索引文件数 {max_files}，停止索引")
+                break
+
+            try:
                 n = self.index_file(fpath, source=source)
                 if n > 0:
                     total_files += 1
                     total_chunks += n
+                    # 实时打印进度
+                    rel_path = os.path.relpath(fpath, dir_path)
+                    print(f"  [{idx}/{total_candidates}] ✓ {rel_path} → {n} 块")
+                else:
+                    skipped_files += 1
+                    # 每 50 个跳过文件打印一次进度
+                    if skipped_files % 50 == 0:
+                        print(f"  [{idx}/{total_candidates}] 已跳过 {skipped_files} 个未变更文件...")
+            except Exception as e:
+                failed_files += 1
+                rel_path = os.path.relpath(fpath, dir_path)
+                print(f"  [{idx}/{total_candidates}] ✗ {rel_path}: {e}")
 
         # 统计
         for fp, meta in self._indexed_files.items():
@@ -207,6 +227,11 @@ class CodeRAGPipeline:
             index_time=elapsed,
             last_updated=time.strftime("%Y-%m-%d %H:%M:%S"),
         )
+
+        # 汇总报告
+        print(f"\n  索引完成: {total_files} 文件, {total_chunks} 代码块, "
+              f"跳过 {skipped_files}, 失败 {failed_files}, 耗时 {elapsed:.1f}s")
+
         logger.info(
             f"目录索引完成: {total_files} 文件, {total_chunks} 代码块, "
             f"耗时 {elapsed:.1f}s"
@@ -455,14 +480,17 @@ class CodeRAGPipeline:
 
         # 分批写入，DashScope text-embedding-v4 限制每批最多 10 个文档
         batch_size = min(settings.get("rag.embedding.batch_size", 10), 10)
+        total_batches = (len(docs) + batch_size - 1) // batch_size
         for i in range(0, len(docs), batch_size):
             batch_docs = docs[i : i + batch_size]
             batch_ids = ids[i : i + batch_size]
+            batch_num = i // batch_size + 1
             try:
                 self.vector_store.add_documents(batch_docs, ids=batch_ids)
+                logger.debug(f"向量写入批次 {batch_num}/{total_batches} 成功（{len(batch_docs)} 文档）")
             except Exception as e:
                 logger.warning(
-                    f"向量写入批次 {i // batch_size} 失败（{len(batch_docs)} 文档）: {e}"
+                    f"向量写入批次 {batch_num}/{total_batches} 失败（{len(batch_docs)} 文档）: {e}"
                 )
                 # 逐条重试，跳过有问题的文档
                 for doc, doc_id in zip(batch_docs, batch_ids):

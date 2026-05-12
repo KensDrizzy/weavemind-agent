@@ -5,7 +5,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from rag.models import CodeChunk
 
@@ -51,12 +51,18 @@ CODE_EXTENSIONS = {
     ".ini": "ini",
 }
 
-# 跳过索引的目录
+# 跳过索引的目录（支持前缀匹配：如 .venv 会匹配 .venv_py39_backup）
 SKIP_DIRS = {
     ".git", ".svn", ".hg", "node_modules", "__pycache__",
-    ".venv", "venv", ".env", ".tox", ".mypy_cache",
-    ".pytest_cache", "dist", "build", "egg-info",
-    ".idea", ".vscode", ".weavemind",
+    ".venv", "venv", "env", ".env", ".tox", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", "dist", "build", "egg-info",
+    ".idea", ".vscode", ".weavemind", "site-packages",
+    ".cache", ".caches", "coverage", ".coverage",
+    "htmlcov", ".docs-build", "target",  # Java/Maven
+    "out", "bin", "obj",  # C#/C++
+    ".next", ".nuxt",  # Node.js
+    "vendor",  # Go/PHP
+    ".terraform",  # Terraform
 }
 
 # 跳过索引的文件模式
@@ -67,6 +73,13 @@ SKIP_FILE_PATTERNS = {
     ".mp3", ".mp4", ".wav", ".avi", ".mov",
     ".db", ".sqlite", ".sqlite3",
     ".pkl", ".pickle", ".npy", ".npz",
+    ".lock", ".toml.bak",  # 锁文件和备份
+}
+
+# 跳过索引的文件名（精确匹配）
+SKIP_FILE_NAMES = {
+    "py.typed", "VERSION", "LICENSE", "COPYING",
+    "MANIFEST.in", "setup.cfg", ".gitkeep", ".keep",
 }
 
 
@@ -143,6 +156,11 @@ def should_index_file(file_path: str, max_file_size: int = 100_000) -> bool:
     Returns:
         True 表示应该索引
     """
+    # 检查文件名（精确匹配）
+    file_name = os.path.basename(file_path)
+    if file_name in SKIP_FILE_NAMES:
+        return False
+
     # 检查扩展名
     _, ext = os.path.splitext(file_path)
     if ext.lower() in SKIP_FILE_PATTERNS:
@@ -159,9 +177,15 @@ def should_index_file(file_path: str, max_file_size: int = 100_000) -> bool:
 
 
 def should_index_dir(dir_path: str) -> bool:
-    """判断目录是否应该被索引（跳过 .git/node_modules 等）。"""
+    """判断目录是否应该被索引（跳过 .git/node_modules 等）。
+
+    支持前缀匹配：如果 SKIP_DIRS 中有 ".venv"，则 ".venv_py39_backup" 也会被跳过。
+    """
     dir_name = os.path.basename(dir_path)
-    return dir_name not in SKIP_DIRS
+    for skip in SKIP_DIRS:
+        if dir_name == skip or dir_name.startswith(skip):
+            return False
+    return True
 
 
 def get_chunker_for_file(file_path: str) -> BaseChunker:

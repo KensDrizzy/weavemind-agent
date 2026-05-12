@@ -170,7 +170,7 @@ def create_mcp_tool_instance(
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
                     future = pool.submit(
-                        asyncio.run, conn.call_tool(tname, filtered_kwargs)
+                        asyncio.run, connx.call_tool(tname, filtered_kwargs)
                     )
                     result = future.result(timeout=120)
                     return _format_result(result)
