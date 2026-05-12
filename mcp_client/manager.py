@@ -23,9 +23,9 @@ class MCPManager:
         if servers_config is None:
             import settings
             servers_config = settings.get("mcp.servers", {})
-            self._servers_config_read = True  # 配置来自 settings
+            self._servers_config_read = True
         else:
-            self._servers_config_read = False  # 配置由调用方显式传入
+            self._servers_config_read = False
 
         self._servers_config = servers_config
 
@@ -34,6 +34,7 @@ class MCPManager:
         self._tools: List[WeaveMindTool] = []
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._chrome_launcher = None
 
     async def initialize(self) -> bool:
         """
@@ -71,6 +72,11 @@ class MCPManager:
                 if not config.get("enabled", True):
                     logger.info("MCP Server '%s' 已禁用，跳过", name)
                     continue
+
+                # Chrome 自动启动：检查 chrome 子配置的 auto_start
+                chrome_config = config.get("chrome")
+                if isinstance(chrome_config, dict) and chrome_config.get("auto_start", False):
+                    self._ensure_chrome_running(chrome_config)
 
                 try:
                     conn = MCPConnection(config)
@@ -125,6 +131,12 @@ class MCPManager:
         self._tools.clear()
         self._initialized = False
 
+        # 停止由启动器启动的 Chrome
+        if self._chrome_launcher and self._chrome_launcher.launched_by_us:
+            logger.info("正在停止由 MCPManager 启动的 Chrome...")
+            self._chrome_launcher.stop()
+            self._chrome_launcher = None
+
         logger.info("MCP 连接已清理")
 
     def get_tools(self) -> List[WeaveMindTool]:
@@ -145,6 +157,33 @@ class MCPManager:
     def is_initialized(self) -> bool:
         """检查是否已完成初始化。"""
         return self._initialized
+
+    def _ensure_chrome_running(self, chrome_config: dict) -> None:
+        """确保 Chrome 在调试端口运行，未运行则自动启动。
+
+        幂等操作：Chrome 已运行时直接返回，不会重复启动。
+        仅停止由本启动器启动的 Chrome（launched_by_us）。
+        """
+        from mcp_client.chrome_launcher import ChromeLauncher
+
+        port = chrome_config.get("port", 9222)
+        headless = chrome_config.get("headless", False)
+        executable = chrome_config.get("executable")
+
+        if self._chrome_launcher is None:
+            self._chrome_launcher = ChromeLauncher(
+                port=port,
+                headless=headless,
+                executable=executable,
+            )
+
+        if not self._chrome_launcher.is_running():
+            logger.info("Chrome 未运行，正在自动启动 (port=%d, headless=%s)", port, headless)
+            success = self._chrome_launcher.start()
+            if not success:
+                logger.warning("Chrome 自动启动失败，MCP Server 可能无法连接")
+        else:
+            logger.info("Chrome 已在端口 %d 运行，跳过启动", port)
 
     async def health_check(self) -> dict[str, bool]:
         """检查所有连接的健康状态。"""

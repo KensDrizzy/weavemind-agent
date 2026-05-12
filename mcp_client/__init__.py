@@ -12,5 +12,6 @@
 
 from mcp_client.manager import MCPManager
 from mcp_client.client import MCPConnection
+from mcp_client.chrome_launcher import ChromeLauncher
 
-__all__ = ["MCPManager", "MCPConnection"]
+__all__ = ["MCPManager", "MCPConnection", "ChromeLauncher"]

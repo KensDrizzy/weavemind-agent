@@ -152,18 +152,30 @@ class WeaveMindCLI:
         )
 
     def _init_mcp_sync(self):
-        """同步方式初始化 MCP（在 REPL 启动前执行）。"""
+        """同步方式初始化 MCP（在 REPL 启动前执行）。
+
+        使用持久后台线程运行事件循环，避免 asyncio.run() 结束时
+        关闭事件循环导致 MCP stdio 连接的异步生成器被强制关闭
+        （anyio TaskGroup 的 cancel scope 跨 task 退出会报 RuntimeError）。
+        """
         import asyncio
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # 已有事件循环中，创建新任务
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, self._async_init_mcp())
-                    future.result(timeout=30)
-            else:
-                asyncio.run(self._async_init_mcp())
+            # 创建持久事件循环（在后台线程中运行，不会提前关闭）
+            self._mcp_loop = asyncio.new_event_loop()
+
+            import threading
+            self._mcp_thread = threading.Thread(
+                target=self._mcp_loop.run_forever,
+                name="mcp-event-loop",
+                daemon=True,
+            )
+            self._mcp_thread.start()
+
+            # 在持久事件循环中执行 MCP 初始化
+            future = asyncio.run_coroutine_threadsafe(
+                self._async_init_mcp(), self._mcp_loop
+            )
+            future.result(timeout=30)  # 等待初始化完成
         except Exception as e:
             logger.warning(f"MCP 初始化失败（不影响主流程）: {e}")
 
@@ -193,8 +205,15 @@ class WeaveMindCLI:
         """退出时清理 MCP 资源。"""
         import asyncio
         try:
-            if self._mcp_initialized:
-                asyncio.run(self.mcp_manager.shutdown())
+            if self._mcp_initialized and hasattr(self, '_mcp_loop') and self._mcp_loop:
+                # 在持久事件循环中执行 shutdown
+                future = asyncio.run_coroutine_threadsafe(
+                    self.mcp_manager.shutdown(), self._mcp_loop
+                )
+                future.result(timeout=10)
+
+                # 停止事件循环
+                self._mcp_loop.call_soon_threadsafe(self._mcp_loop.stop)
         except Exception as e:
             logger.debug(f"MCP 清理时出错: {e}")
 

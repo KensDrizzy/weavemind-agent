@@ -25,12 +25,20 @@ class MCPConnection:
         self.name: str = server_config["name"]
         self.transport: str = server_config.get("transport", "stdio")
         self.config: dict = server_config
+        self.server_type: str = self._detect_server_type()
 
         # Runtime state
         self._session: Optional[ClientSession] = None
         self._exit_stack: Optional[AsyncExitStack] = None
         self._tools_info: list[MCPToolInfo] = []
         self._connected: bool = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None  # 保存连接时的事件循环
+
+    def _detect_server_type(self) -> str:
+        """根据配置特征检测 server 类型，用于差异化处理。"""
+        if "chrome" in self.config and isinstance(self.config["chrome"], dict):
+            return "chrome"
+        return "generic"
 
     async def connect(self) -> bool:
         """
@@ -57,6 +65,7 @@ class MCPConnection:
                 tools_response = await self._session.list_tools()
                 self._tools_info = tools_response.tools
                 self._connected = True
+                self._loop = asyncio.get_event_loop()  # 保存连接时的事件循环
 
                 logger.info(
                     "MCP Server '%s' 连接成功，发现 %d 个工具: %s",
@@ -111,16 +120,24 @@ class MCPConnection:
         return True
 
     def _merge_env(self) -> Optional[dict[str, str]]:
-        """合并环境变量：系统环境 + 配置中指定的 env。"""
+        """合并环境变量：系统环境 + 配置中指定的 env。
+
+        支持 ${VAR} 语法在字符串内引用环境变量，如：
+          PATH: "/opt/homebrew/bin:${PATH}"
+        """
         env = self.config.get("env", {})
         if env:
+            import re
             merged = dict(os.environ)
             for key, value in env.items():
-                if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
-                    var_name = value[2:-1]
-                    merged[key] = os.environ.get(var_name, "")
-                else:
+                if not isinstance(value, str):
                     merged[key] = str(value)
+                    continue
+                # 替换字符串中的 ${VAR} 引用
+                def _replace_var(match):
+                    var_name = match.group(1)
+                    return os.environ.get(var_name, "")
+                merged[key] = re.sub(r'\$\{(\w+)\}', _replace_var, value)
             return merged
         return None
 

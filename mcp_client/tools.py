@@ -146,6 +146,9 @@ def create_mcp_tool_instance(
     使用 StructuredTool.from_function 将 MCP 工具封装为 LangChain 工具，
     这是 LangChain 推荐的动态工具创建方式，完全兼容 Pydantic V2。
 
+    当 connection.server_type == "chrome" 且工具属于 Chrome DevTools 时，
+    使用 Chrome 专用格式化器（截图保存文件、DOM 截断等）。
+
     Args:
         tool_info: MCP 工具元数据（来自 tools/list）
         connection: MCPConnection 实例
@@ -154,47 +157,63 @@ def create_mcp_tool_instance(
         WeaveMindTool 实例，可直接注册到 ToolRegistry
     """
     from langchain_core.tools import StructuredTool
+    from mcp_client.chrome_formatter import is_chrome_tool, format_chrome_result
 
     tname = tool_info.name
     desc = _format_description(tool_info)
     args_schema = _create_args_schema(tool_info)
     conn = connection
 
+    # 确定结果格式化器
+    use_chrome_formatter = (
+        conn.server_type == "chrome" and is_chrome_tool(tname)
+    )
+
+    def _format(result: Any) -> str:
+        if use_chrome_formatter:
+            return format_chrome_result(tname, result)
+        return _format_result(result)
+
     # 创建同步调用函数（闭包捕获 conn 和 tname）
     def sync_func(**kwargs) -> str:
-        # 过滤掉 None 值参数，避免 MCP Server 验证失败
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
+            # 优先使用 MCP 连接的事件循环（避免 asyncio.run 关闭循环导致 stdio 连接断开）
+            if conn._loop and conn._loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    conn.call_tool(tname, filtered_kwargs), conn._loop
+                )
+                result = future.result(timeout=120)
+                return _format(result)
+
+            # 降级：没有持久事件循环时使用 asyncio.run
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
                     future = pool.submit(
-                        asyncio.run, connx.call_tool(tname, filtered_kwargs)
+                        asyncio.run, conn.call_tool(tname, filtered_kwargs)
                     )
                     result = future.result(timeout=120)
-                    return _format_result(result)
+                    return _format(result)
             else:
                 result = asyncio.run(conn.call_tool(tname, filtered_kwargs))
-                return _format_result(result)
+                return _format(result)
         except RuntimeError:
             result = asyncio.run(conn.call_tool(tname, filtered_kwargs))
-            return _format_result(result)
+            return _format(result)
         except Exception as e:
             return f"[MCP调用错误] {e}"
 
     # 创建异步调用函数
     async def async_func(**kwargs) -> str:
-        # 过滤掉 None 值参数，避免 MCP Server 验证失败
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
             result = await conn.call_tool(tname, filtered_kwargs)
-            return _format_result(result)
+            return _format(result)
         except Exception as e:
             return f"[MCP调用错误] {e}"
 
-    # 使用 StructuredTool.from_function 创建工具
-    # 这是 LangChain 官方推荐的动态工具创建方式
     tool = StructuredTool.from_function(
         func=sync_func,
         coroutine=async_func,
