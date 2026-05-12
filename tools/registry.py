@@ -29,21 +29,35 @@ class ToolRegistry:
         self._register_mcp_tools()
 
     def _register_builtins(self):
-        # 将读取/检索类工具放在前面，降低简单查询时对 Bash 的误用概率。
-        for tool in [
-            ReadTool(), GlobTool(), GrepTool(), WebFetchTool(), WebSearchTool(),
-            AskUserTool(), EditTool(), WriteTool(), BashTool(),
+        # 工具注册顺序影响 LLM 选择倾向：排在前面更容易被选中。
+        # SearchCode 优先级最高（语义检索一次搞定），Read/Glob/Grep 作为回退。
+        tools_list = []
+
+        # RAG 工具优先注册（仅在 RAG 启用时）
+        if settings.get("rag.enabled", False) and self._rag_pipeline:
+            tools_list.append(SearchCodeTool(rag_pipeline=self._rag_pipeline))
+            tools_list.append(IndexWorkspaceTool(rag_pipeline=self._rag_pipeline))
+            logger.info("RAG 工具已注册: SearchCode, IndexWorkspace")
+
+        # 读取/检索类工具
+        tools_list.extend([
+            ReadTool(), GlobTool(), GrepTool(),
+            WebFetchTool(), WebSearchTool(),
+            AskUserTool(),
+        ])
+        # 修改类工具
+        tools_list.extend([
+            EditTool(), WriteTool(), BashTool(),
+        ])
+        # 记忆工具
+        tools_list.extend([
             MemoryAddTool(memory_manager=self._memory_manager),
             MemorySearchTool(memory_manager=self._memory_manager),
             CoreMemoryEditTool(memory_manager=self._memory_manager),
-        ]:
-            self._tools[tool.name] = tool
+        ])
 
-        # RAG 工具（仅在 RAG 启用时注册）
-        if settings.get("rag.enabled", False) and self._rag_pipeline:
-            self._tools["SearchCode"] = SearchCodeTool(rag_pipeline=self._rag_pipeline)
-            self._tools["IndexWorkspace"] = IndexWorkspaceTool(rag_pipeline=self._rag_pipeline)
-            logger.info("RAG 工具已注册: SearchCode, IndexWorkspace")
+        for tool in tools_list:
+            self._tools[tool.name] = tool
 
     def _register_mcp_tools(self):
         """注册 MCP 工具（从 MCPManager 获取已连接 Server 的工具）。"""

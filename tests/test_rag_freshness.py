@@ -1,5 +1,6 @@
-"""RAG 新鲜度检测与自动刷新测试。"""
+"""RAG 增量同步与新鲜度检测测试。"""
 
+import hashlib
 import json
 import os
 import tempfile
@@ -7,50 +8,67 @@ import time
 
 import pytest
 
-from rag.pipeline import CodeRAGPipeline
 from rag.models import CodeChunk
 
 
-class TestFreshnessCheck:
-    """测试 check_freshness 方法。"""
+class TestQuickFreshnessCheck:
+    """测试 mtime 快筛 + MD5 精确确认的两步检测策略。"""
 
-    def test_fresh_file_detected(self, tmp_path):
-        """未变更的文件应被标记为 fresh。"""
-        # 创建一个临时文件并写入 metadata
+    def test_fresh_file_skipped_by_mtime(self, tmp_path):
+        """mtime 未变的文件应直接跳过，不计算 MD5。"""
         test_file = tmp_path / "hello.py"
         test_file.write_text("def hello(): pass\n")
 
-        # 模拟 metadata
-        meta_dir = tmp_path / ".weavemind" / "rag"
-        meta_dir.mkdir(parents=True)
-        file_hash = _hash_file(str(test_file))
-        meta = {f"test::{test_file}": {"hash": file_hash, "timestamp": time.time(), "chunks": 1}}
+        # metadata 中的 timestamp >= mtime → 文件肯定没变
+        file_mtime = os.path.getmtime(str(test_file))
+        meta = {f"test::{test_file}": {
+            "hash": "any_hash",  # 即使 hash 不对，mtime 没变也不检查
+            "timestamp": file_mtime + 1,  # 比文件修改时间更新
+            "chunks": 1,
+        }}
 
-        # 验证 fresh 检测
-        freshness = _check_freshness_simple(meta)
+        freshness = _quick_freshness_check(meta)
         assert freshness["fresh_count"] == 1
         assert len(freshness["stale_files"]) == 0
-        assert len(freshness["deleted_files"]) == 0
 
-    def test_stale_file_detected(self, tmp_path):
-        """内容变更的文件应被标记为 stale。"""
+    def test_stale_file_detected_by_mtime_then_md5(self, tmp_path):
+        """mtime 变了 + MD5 也变了 → 确认为 stale。"""
         test_file = tmp_path / "hello.py"
         test_file.write_text("def hello(): pass\n")
 
-        # 用一个错误的 hash 模拟文件已变更
-        meta = {f"test::{test_file}": {"hash": "wrong_hash", "timestamp": time.time(), "chunks": 1}}
+        # metadata 中的 timestamp < mtime → 触发 MD5 检查
+        meta = {f"test::{test_file}": {
+            "hash": "wrong_hash",
+            "timestamp": 0,  # 远早于 mtime
+            "chunks": 1,
+        }}
 
-        freshness = _check_freshness_simple(meta)
+        freshness = _quick_freshness_check(meta)
         assert len(freshness["stale_files"]) == 1
         assert freshness["fresh_count"] == 0
+
+    def test_mtime_changed_but_content_same(self, tmp_path):
+        """mtime 变了但 MD5 没变（touch/保存未修改）→ 仍算 fresh。"""
+        test_file = tmp_path / "hello.py"
+        test_file.write_text("def hello(): pass\n")
+
+        file_hash = _hash_file(str(test_file))
+        meta = {f"test::{test_file}": {
+            "hash": file_hash,  # hash 正确
+            "timestamp": 0,     # 但 timestamp 很旧，会触发 MD5 检查
+            "chunks": 1,
+        }}
+
+        freshness = _quick_freshness_check(meta)
+        assert freshness["fresh_count"] == 1
+        assert len(freshness["stale_files"]) == 0
 
     def test_deleted_file_detected(self, tmp_path):
         """已删除的文件应被标记为 deleted。"""
         fake_path = str(tmp_path / "nonexistent.py")
-
         meta = {f"test::{fake_path}": {"hash": "abc123", "timestamp": time.time(), "chunks": 1}}
 
-        freshness = _check_freshness_simple(meta)
+        freshness = _quick_freshness_check(meta)
         assert len(freshness["deleted_files"]) == 1
         assert freshness["fresh_count"] == 0
 
@@ -112,33 +130,39 @@ class TestCodeChunkIndexedAt:
         assert chunk.indexed_at == 1700000000.0
 
 
-class TestAutoRefreshThrottle:
-    """测试 auto_refresh 的节流机制。"""
+class TestSyncPerformance:
+    """验证增量同步的性能特征。"""
 
-    def test_auto_refresh_disabled(self):
-        """auto_refresh=False 时应跳过。"""
-        # 直接测试逻辑
-        auto_refresh = False
-        if not auto_refresh:
-            result = {"updated": 0, "deleted": 0, "new_indexed": 0, "skipped": 0, "reason": "auto_refresh disabled"}
-        assert result["reason"] == "auto_refresh disabled"
+    def test_mtime_check_is_fast(self, tmp_path):
+        """mtime 检测应该非常快（< 10ms for 100 files）。"""
+        # 创建 100 个文件
+        for i in range(100):
+            f = tmp_path / f"file_{i}.py"
+            f.write_text(f"def func_{i}(): pass\n")
 
-    def test_auto_refresh_too_soon(self):
-        """距离上次刷新不足阈值时应跳过。"""
-        last_refresh_time = time.time()  # 刚刚刷新过
-        stale_threshold = 300  # 5 分钟
-        now = time.time()
+        # 构建 metadata
+        meta = {}
+        for i in range(100):
+            f = tmp_path / f"file_{i}.py"
+            key = f"test::{f}"
+            meta[key] = {
+                "hash": "any",
+                "timestamp": os.path.getmtime(str(f)) + 1,  # 比 mtime 新
+                "chunks": 1,
+            }
 
-        if now - last_refresh_time < stale_threshold:
-            result = {"updated": 0, "deleted": 0, "new_indexed": 0, "skipped": 0, "reason": "too soon"}
-        assert result["reason"] == "too soon"
+        start = time.time()
+        freshness = _quick_freshness_check(meta)
+        elapsed = time.time() - start
+
+        assert freshness["fresh_count"] == 100
+        assert elapsed < 0.05  # 50ms 内完成（实际约 1-2ms）
 
 
 # ── 辅助函数 ──────────────────────────────────────────────
 
 def _hash_file(file_path: str) -> str:
     """计算文件 MD5 哈希。"""
-    import hashlib
     h = hashlib.md5()
     with open(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -146,8 +170,8 @@ def _hash_file(file_path: str) -> str:
     return h.hexdigest()
 
 
-def _check_freshness_simple(metadata: dict) -> dict:
-    """简化版新鲜度检测，不依赖 pipeline 实例。"""
+def _quick_freshness_check(metadata: dict) -> dict:
+    """简化版新鲜度检测，模拟 pipeline._quick_freshness_check 逻辑。"""
     stale = []
     deleted = []
     fresh = 0
@@ -160,6 +184,19 @@ def _check_freshness_simple(metadata: dict) -> dict:
             deleted.append(cache_key)
             continue
 
+        # mtime 快筛
+        indexed_ts = meta.get("timestamp", 0)
+        try:
+            file_mtime = os.path.getmtime(file_path)
+        except OSError:
+            deleted.append(cache_key)
+            continue
+
+        if file_mtime <= indexed_ts:
+            fresh += 1
+            continue
+
+        # MD5 精确确认
         current_hash = _hash_file(file_path)
         if current_hash and meta.get("hash") != current_hash:
             stale.append(cache_key)

@@ -91,10 +91,6 @@ class CodeRAGPipeline:
         )
         self._indexed_files: dict = {}  # file_path -> {hash, timestamp}
         self._load_metadata()
-        # 新鲜度配置
-        self._auto_refresh = settings.get("rag.auto_refresh", True)
-        self._stale_threshold = settings.get("rag.stale_threshold_seconds", 300)  # 5 分钟
-        self._last_refresh_time = 0.0  # 上次自动刷新时间
 
     # ── 索引 ──────────────────────────────────────────────
 
@@ -524,22 +520,87 @@ class CodeRAGPipeline:
         with open(self._metadata_path, "w", encoding="utf-8") as f:
             json.dump(self._indexed_files, f, ensure_ascii=False, indent=2)
 
-    # ── 新鲜度检测与自动刷新 ──────────────────────────────
+    # ── 新鲜度检测与增量同步 ──────────────────────────────
 
-    def check_freshness(self, source_filter: str = None) -> dict:
-        """检测索引新鲜度，返回过期/已删除/新增文件统计。
+    def sync_before_search(self, source_filter: str = None) -> dict:
+        """检索前的增量同步：快速检测变更，静默更新。
 
-        Args:
-            source_filter: 只检查指定 source 的文件（如 "weavemind"）
+        两步检测策略（快+准）：
+        1. mtime 快筛：对比文件修改时间与上次索引时间，筛出可能变更的文件（~1ms）
+        2. MD5 精确确认：只对 mtime 变更的文件做 MD5 对比，确认是否真的变了
+
+        同时处理：已删除文件清理 + 新增文件索引。
 
         Returns:
-            {
-                "stale_files": [文件路径列表],   # 内容已变更
-                "deleted_files": [文件路径列表],  # 文件已删除
-                "new_files": [文件路径列表],      # 新增未索引
-                "fresh_count": int,               # 未变更文件数
-                "total_indexed": int,             # 总已索引文件数
-            }
+            {"updated": int, "deleted": int, "new_indexed": int, "skipped": int}
+        """
+        freshness = self._quick_freshness_check(source_filter)
+        updated = 0
+        deleted_count = 0
+        new_indexed = 0
+
+        # 1. 更新内容变更的文件
+        for cache_key in freshness["stale_files"]:
+            parts = cache_key.split("::", 1)
+            file_path = parts[1] if len(parts) > 1 else parts[0]
+            source = parts[0] if len(parts) > 1 else None
+
+            if not os.path.exists(file_path):
+                continue
+            try:
+                n = self.index_file(file_path, source=source)
+                if n > 0:
+                    updated += 1
+                    logger.info(f"[sync] 更新: {file_path} → {n} 块")
+            except Exception as e:
+                logger.warning(f"[sync] 更新失败: {file_path}: {e}")
+
+        # 2. 清理已删除文件的向量
+        for cache_key in freshness["deleted_files"]:
+            parts = cache_key.split("::", 1)
+            file_path = parts[1] if len(parts) > 1 else parts[0]
+            try:
+                self._remove_file_vectors(file_path)
+                del self._indexed_files[cache_key]
+                deleted_count += 1
+                logger.info(f"[sync] 清理已删除: {file_path}")
+            except Exception as e:
+                logger.warning(f"[sync] 清理失败: {file_path}: {e}")
+
+        # 3. 索引新增文件
+        for file_path in freshness["new_files"]:
+            source = source_filter
+            try:
+                n = self.index_file(file_path, source=source)
+                if n > 0:
+                    new_indexed += 1
+                    logger.info(f"[sync] 新增: {file_path} → {n} 块")
+            except Exception as e:
+                logger.warning(f"[sync] 新增索引失败: {file_path}: {e}")
+
+        # 持久化 metadata
+        if updated > 0 or deleted_count > 0 or new_indexed > 0:
+            self._save_metadata()
+
+        result = {
+            "updated": updated,
+            "deleted": deleted_count,
+            "new_indexed": new_indexed,
+            "skipped": freshness["fresh_count"],
+        }
+        if updated > 0 or deleted_count > 0 or new_indexed > 0:
+            logger.info(f"[sync] 完成: 更新{updated} 清理{deleted_count} 新增{new_indexed}")
+        return result
+
+    def _quick_freshness_check(self, source_filter: str = None) -> dict:
+        """快速新鲜度检测：mtime 快筛 + MD5 精确确认。
+
+        策略：
+        - mtime <= 上次索引时间 → 文件肯定没变，跳过（占绝大多数）
+        - mtime > 上次索引时间 → 可能变了，做 MD5 精确对比
+        - 文件不存在 → 已删除
+
+        性能：618 文件 mtime 扫描 ~1ms，MD5 只对少数变更文件做（通常 0-5 个）。
         """
         stale = []
         deleted = []
@@ -548,7 +609,6 @@ class CodeRAGPipeline:
         for cache_key, meta in list(self._indexed_files.items()):
             # source 过滤
             if source_filter:
-                # cache_key 格式: "source::./path" 或 "./path"
                 if not cache_key.startswith(f"{source_filter}::"):
                     continue
 
@@ -556,19 +616,33 @@ class CodeRAGPipeline:
             parts = cache_key.split("::", 1)
             file_path = parts[1] if len(parts) > 1 else parts[0]
 
-            # 检查文件是否存在
+            # 第一步：检查文件是否存在
             if not os.path.exists(file_path):
                 deleted.append(cache_key)
                 continue
 
-            # 检查内容是否变更
+            # 第二步：mtime 快筛 — 修改时间没变则一定没变
+            indexed_ts = meta.get("timestamp", 0)
+            try:
+                file_mtime = os.path.getmtime(file_path)
+            except OSError:
+                deleted.append(cache_key)
+                continue
+
+            if file_mtime <= indexed_ts:
+                # 文件修改时间 <= 上次索引时间 → 肯定没变
+                fresh += 1
+                continue
+
+            # 第三步：mtime 变了 → MD5 精确确认是否真的变了
             current_hash = self._file_hash(file_path)
             if current_hash and meta.get("hash") != current_hash:
                 stale.append(cache_key)
             else:
+                # mtime 变了但内容没变（比如 touch、保存未修改）
                 fresh += 1
 
-        # 检测新增文件（仅当有 source_filter 时，扫描对应目录）
+        # 检测新增文件（仅当有 source_filter 时）
         new_files = []
         if source_filter:
             new_files = self._find_new_files(source_filter)
@@ -623,83 +697,6 @@ class CodeRAGPipeline:
                         new_files.append(fpath)
 
         return new_files
-
-    def auto_refresh(self, source_filter: str = None) -> dict:
-        """自动检测并增量更新过期索引。
-
-        在 SearchCode 调用前自动触发，静默更新变更文件、清理已删除文件。
-        不会全量重建，只处理差异部分。
-
-        Returns:
-            {"updated": int, "deleted": int, "new_indexed": int, "skipped": int}
-        """
-        if not self._auto_refresh:
-            return {"updated": 0, "deleted": 0, "new_indexed": 0, "skipped": 0, "reason": "auto_refresh disabled"}
-
-        # 防止频繁扫描：距离上次刷新不足阈值时间则跳过
-        now = time.time()
-        if now - self._last_refresh_time < self._stale_threshold:
-            return {"updated": 0, "deleted": 0, "new_indexed": 0, "skipped": 0, "reason": "too soon"}
-        self._last_refresh_time = now
-
-        freshness = self.check_freshness(source_filter)
-        updated = 0
-        deleted_count = 0
-        new_indexed = 0
-
-        # 1. 更新内容变更的文件
-        for cache_key in freshness["stale_files"]:
-            parts = cache_key.split("::", 1)
-            file_path = parts[1] if len(parts) > 1 else parts[0]
-            source = parts[0] if len(parts) > 1 else None
-
-            if not os.path.exists(file_path):
-                continue
-            try:
-                n = self.index_file(file_path, source=source)
-                if n > 0:
-                    updated += 1
-                    logger.info(f"[auto_refresh] 更新: {file_path} → {n} 块")
-            except Exception as e:
-                logger.warning(f"[auto_refresh] 更新失败: {file_path}: {e}")
-
-        # 2. 清理已删除文件的向量
-        for cache_key in freshness["deleted_files"]:
-            parts = cache_key.split("::", 1)
-            file_path = parts[1] if len(parts) > 1 else parts[0]
-            try:
-                self._remove_file_vectors(file_path)
-                del self._indexed_files[cache_key]
-                deleted_count += 1
-                logger.info(f"[auto_refresh] 清理已删除: {file_path}")
-            except Exception as e:
-                logger.warning(f"[auto_refresh] 清理失败: {file_path}: {e}")
-
-        # 3. 索引新增文件
-        for file_path in freshness["new_files"]:
-            # 从路径推断 source
-            source = source_filter
-            try:
-                n = self.index_file(file_path, source=source)
-                if n > 0:
-                    new_indexed += 1
-                    logger.info(f"[auto_refresh] 新增: {file_path} → {n} 块")
-            except Exception as e:
-                logger.warning(f"[auto_refresh] 新增索引失败: {file_path}: {e}")
-
-        # 持久化 metadata
-        if updated > 0 or deleted_count > 0 or new_indexed > 0:
-            self._save_metadata()
-
-        result = {
-            "updated": updated,
-            "deleted": deleted_count,
-            "new_indexed": new_indexed,
-            "skipped": freshness["fresh_count"],
-        }
-        if updated > 0 or deleted_count > 0 or new_indexed > 0:
-            logger.info(f"[auto_refresh] 完成: 更新{updated} 清理{deleted_count} 新增{new_indexed}")
-        return result
 
     def _remove_file_vectors(self, file_path: str):
         """从向量存储中删除指定文件的所有文档。"""

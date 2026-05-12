@@ -73,21 +73,21 @@ class SearchCodeTool(WeaveMindTool):
 
 索引后，Agent 可以自动检索相关代码。"""
 
-        # 自动检测并增量更新过期索引
-        refresh_summary = ""
+        # 检索前增量同步：快速检测变更文件并静默更新
+        sync_summary = ""
         try:
-            refresh_result = self._rag_pipeline.auto_refresh(source_filter=source)
-            if refresh_result.get("updated", 0) > 0 or refresh_result.get("deleted", 0) > 0 or refresh_result.get("new_indexed", 0) > 0:
+            sync_result = self._rag_pipeline.sync_before_search(source_filter=source)
+            if sync_result.get("updated", 0) > 0 or sync_result.get("deleted", 0) > 0 or sync_result.get("new_indexed", 0) > 0:
                 parts = []
-                if refresh_result["updated"] > 0:
-                    parts.append(f"更新{refresh_result['updated']}个变更文件")
-                if refresh_result["deleted"] > 0:
-                    parts.append(f"清理{refresh_result['deleted']}个已删除文件")
-                if refresh_result["new_indexed"] > 0:
-                    parts.append(f"索引{refresh_result['new_indexed']}个新增文件")
-                refresh_summary = f"（自动刷新: {', '.join(parts)}）"
+                if sync_result["updated"] > 0:
+                    parts.append(f"更新{sync_result['updated']}个变更文件")
+                if sync_result["deleted"] > 0:
+                    parts.append(f"清理{sync_result['deleted']}个已删除文件")
+                if sync_result["new_indexed"] > 0:
+                    parts.append(f"索引{sync_result['new_indexed']}个新增文件")
+                sync_summary = f"（增量同步: {', '.join(parts)}）"
         except Exception as e:
-            logger.debug(f"auto_refresh 失败（不影响检索）: {e}")
+            logger.debug(f"sync_before_search 失败（不影响检索）: {e}")
 
         try:
             results = self._rag_pipeline.search(
@@ -111,7 +111,7 @@ class SearchCodeTool(WeaveMindTool):
 2. 使用 /index 命令重新索引代码库
 3. 尝试使用 file_filter 参数过滤文件类型（如 '*.py'）"""
 
-        lines = [f"找到 {len(results)} 个相关代码片段{refresh_summary}：\n"]
+        lines = [f"找到 {len(results)} 个相关代码片段{sync_summary}：\n"]
         for i, r in enumerate(results, 1):
             # 新鲜度标记
             freshness_mark = ""
