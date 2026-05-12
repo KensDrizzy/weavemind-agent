@@ -28,6 +28,7 @@ from permissions.modes import PermissionMode
 from permissions.policy import PermissionPolicy
 from tools.hitl_registry import HitlToolRegistry
 from core.session import SessionManager
+from mcp_client.manager import MCPManager
 import settings
 
 console = Console()
@@ -80,6 +81,10 @@ class WeaveMindCLI:
                 logger.info("RAG Pipeline 已初始化")
             except Exception as e:
                 logger.warning(f"RAG Pipeline 初始化失败: {e}")
+
+        # 初始化 MCP Manager（异步初始化在 run() 中执行）
+        self.mcp_manager = MCPManager()
+        self._mcp_initialized = False
 
         self._create_agent_loop()
         self._direct_intent = DirectIntentHandler(self.tool_registry)
@@ -135,6 +140,7 @@ class WeaveMindCLI:
             hitl_handler=self.hitl_handler,
             memory_manager=self.memory,
             rag_pipeline=self.rag_pipeline,
+            mcp_manager=self.mcp_manager if self._mcp_initialized else None,
         )
         self._direct_intent = DirectIntentHandler(self.tool_registry)
         self.agent_loop = AgentLoop(
@@ -144,6 +150,53 @@ class WeaveMindCLI:
             memory=self.memory,
             force_plan_mode=force_plan,
         )
+
+    def _init_mcp_sync(self):
+        """同步方式初始化 MCP（在 REPL 启动前执行）。"""
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # 已有事件循环中，创建新任务
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, self._async_init_mcp())
+                    future.result(timeout=30)
+            else:
+                asyncio.run(self._async_init_mcp())
+        except Exception as e:
+            logger.warning(f"MCP 初始化失败（不影响主流程）: {e}")
+
+    async def _async_init_mcp(self):
+        """异步初始化 MCP Manager 并重建 AgentLoop。"""
+        try:
+            success = await self.mcp_manager.initialize()
+            if success:
+                self._mcp_initialized = True
+                # MCP 初始化后重建 AgentLoop（含 MCP 工具）
+                self._create_agent_loop()
+
+                # 显示 MCP 工具信息
+                mcp_info = self.mcp_manager.get_tools_info()
+                if mcp_info:
+                    console.print("\n[dim]📡 MCP Servers:[/dim]")
+                    for server, tools in mcp_info.items():
+                        tool_preview = ", ".join(tools[:3])
+                        if len(tools) > 3:
+                            tool_preview += f"... (+{len(tools)-3})"
+                        console.print(f"[dim]   • {server}: {tool_preview}[/dim]")
+                    console.print()
+        except Exception as e:
+            logger.warning(f"MCP 异步初始化失败: {e}")
+
+    def _cleanup_mcp(self):
+        """退出时清理 MCP 资源。"""
+        import asyncio
+        try:
+            if self._mcp_initialized:
+                asyncio.run(self.mcp_manager.shutdown())
+        except Exception as e:
+            logger.debug(f"MCP 清理时出错: {e}")
 
     def _should_auto_team(self, user_input: str) -> bool:
         """判断是否应自动使用 Team 模式。"""
@@ -176,6 +229,9 @@ class WeaveMindCLI:
         """启动 REPL。"""
         # 打印立体文 WeaveMind 标题
         self._print_banner()
+        
+        # 异步初始化 MCP
+        self._init_mcp_sync()
         
         console.print(Panel(
             "[bold]WeaveMind Agent[/bold]\n"
@@ -225,6 +281,11 @@ class WeaveMindCLI:
                         console.print(f"\n[cyan]👥 Multi-Agent 模式已{status}[/cyan]\n")
                         continue
 
+                    if result == "clear":
+                        self.conversation.clear()
+                        console.print("[dim]对话历史已清空[/dim]")
+                        continue
+
                     if isinstance(result, str) and result in [
                         PermissionMode.DEFAULT,
                         PermissionMode.ACCEPT_EDITS,
@@ -253,15 +314,18 @@ class WeaveMindCLI:
                 import time
                 now = time.monotonic()
                 if self._ctrl_c_count > 0 and (now - self._ctrl_c_last) < self._ctrl_c_window:
+                    self._cleanup_mcp()
                     console.print("\n[dim]再见！[/dim]")
                     sys.exit(0)
                 self._ctrl_c_count += 1
                 self._ctrl_c_last = now
                 console.print("\n[yellow]再按一次 Ctrl+C 退出，或输入 /exit 退出[/yellow]")
             except EOFError:
+                self._cleanup_mcp()
                 console.print("\n[dim]再见！[/dim]")
                 sys.exit(0)
             except SystemExit:
+                self._cleanup_mcp()
                 console.print("\n[dim]再见！[/dim]")
                 sys.exit(0)
             except Exception as e:
@@ -311,6 +375,15 @@ class WeaveMindCLI:
 
         # 将用户输入加入对话历史
         self.conversation.append(HumanMessage(content=user_input))
+
+        # 对话历史长度保护：超过 20 轮自动截断旧消息（保留最近 10 轮）
+        MAX_CONVERSATION_MESSAGES = 40  # 20 轮 × 2 条/轮
+        if len(self.conversation) > MAX_CONVERSATION_MESSAGES:
+            kept = self.conversation[-MAX_CONVERSATION_MESSAGES:]
+            dropped = len(self.conversation) - len(kept)
+            self.conversation = kept
+            logger.info(f"对话历史过长，已截断 {dropped} 条旧消息")
+            console.print(f"[dim]对话历史过长，已自动截断 {dropped} 条旧消息[/dim]")
 
         self.stream_renderer.reset(expanded=self.stream_details_expanded)
         self.stream_renderer.start()

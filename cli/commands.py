@@ -96,6 +96,7 @@ def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None) -> 
         if hasattr(agent_loop, 'tool_registry') and hasattr(agent_loop.tool_registry, 'hitl_handler'):
             agent_loop.tool_registry.hitl_handler.clear_approved_all()
         console.clear()
+        return "clear"
 
     else:
         console.print(f"\n[red]❌ 未知命令: {name}[/red]")

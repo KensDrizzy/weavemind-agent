@@ -1,4 +1,4 @@
-"""工具注册表 — 管理所有可用工具。"""
+"""工具注册表 — 管理所有可用工具，包括内置工具和 MCP 工具。"""
 
 import logging
 
@@ -9,8 +9,8 @@ from tools.builtin.edit import EditTool
 from tools.builtin.bash import BashTool
 from tools.builtin.glob import GlobTool
 from tools.builtin.grep import GrepTool
-from tools.builtin.web_search import WebSearch
-from tools.builtin.web_fetch import WebFetch
+from tools.builtin.web_search import WebSearchTool
+from tools.builtin.web_fetch import WebFetchTool
 from tools.builtin.ask_user import AskUserTool
 from tools.builtin.memory_tools import MemoryAddTool, MemorySearchTool, CoreMemoryEditTool
 from tools.builtin.rag_tools import SearchCodeTool, IndexWorkspaceTool
@@ -19,16 +19,19 @@ logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
-    def __init__(self, memory_manager=None, rag_pipeline=None):
+    def __init__(self, memory_manager=None, rag_pipeline=None, mcp_manager=None):
         self._tools: dict = {}
         self._memory_manager = memory_manager
         self._rag_pipeline = rag_pipeline
+        self._mcp_manager = mcp_manager
+        self._mcp_tools_registered = False
         self._register_builtins()
+        self._register_mcp_tools()
 
     def _register_builtins(self):
         # 将读取/检索类工具放在前面，降低简单查询时对 Bash 的误用概率。
         for tool in [
-            ReadTool(), GlobTool(), GrepTool(), WebFetch, WebSearch,
+            ReadTool(), GlobTool(), GrepTool(), WebFetchTool(), WebSearchTool(),
             AskUserTool(), EditTool(), WriteTool(), BashTool(),
             MemoryAddTool(memory_manager=self._memory_manager),
             MemorySearchTool(memory_manager=self._memory_manager),
@@ -41,6 +44,34 @@ class ToolRegistry:
             self._tools["SearchCode"] = SearchCodeTool(rag_pipeline=self._rag_pipeline)
             self._tools["IndexWorkspace"] = IndexWorkspaceTool(rag_pipeline=self._rag_pipeline)
             logger.info("RAG 工具已注册: SearchCode, IndexWorkspace")
+
+    def _register_mcp_tools(self):
+        """注册 MCP 工具（从 MCPManager 获取已连接 Server 的工具）。"""
+        if not self._mcp_manager:
+            return
+
+        if not self._mcp_manager.is_initialized():
+            logger.debug("MCP Manager 尚未初始化，跳过工具注册")
+            return
+
+        mcp_tools = self._mcp_manager.get_tools()
+        registered = 0
+        skipped = 0
+
+        for tool in mcp_tools:
+            if tool.name in self._tools:
+                logger.warning(
+                    "MCP 工具 '%s' 与内置工具重名，MCP 版本覆盖内置版本",
+                    tool.name,
+                )
+
+            self._tools[tool.name] = tool
+            registered += 1
+            logger.debug("注册 MCP 工具: %s", tool.name)
+
+        self._mcp_tools_registered = True
+        if registered > 0:
+            logger.info("MCP 工具注册完成: %d 个成功, %d 个跳过", registered, skipped)
 
     def register(self, tool):
         self._tools[tool.name] = tool

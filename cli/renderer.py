@@ -345,7 +345,14 @@ def print_stream_end():
 
 
 class InteractionStreamRenderer:
-    """流式交互渲染器：展示思考状态、工具进度和 token 统计。"""
+    """流式交互渲染器：展示思考状态、工具进度和 token 统计。
+
+    策略：
+    - 所有轮次文本先灰色流式输出（推理过程可见）
+    - on_llm_end 时判断：如果本轮没有 tool_calls 且不是第1轮，说明是最终回答
+    - 最终回答在 on_llm_end 时用白色重新输出（覆盖灰色）
+    - 第1轮（无前序工具调用）的文本直接白色输出
+    """
 
     def __init__(self, rich_console: Console = None, expanded: bool = False):
         self.console = rich_console or console
@@ -355,18 +362,23 @@ class InteractionStreamRenderer:
 
     @property
     def has_streamed_answer(self) -> bool:
-        return self._answer_started
+        return self._has_streamed_final_answer
 
     def reset(self, expanded: bool = None):
         if expanded is not None:
             self._expanded = expanded
-        self._answer_started = False
+        self._has_streamed_final_answer = False
         self._started_at = time.perf_counter()
         self._input_tokens = 0
         self._output_tokens = 0
         self._total_tokens = 0
         self._call_index = 0
         self._has_content_in_current_call = False
+        self._thinking_in_current_call = False
+        # 累积当前轮次的文本，用于最终回答时白色重输出
+        self._current_call_text = ""
+        # 上一轮是否有 tool_calls
+        self._prev_call_had_tool_calls = False
 
     def set_expanded(self, expanded: bool):
         self._expanded = expanded
@@ -382,6 +394,8 @@ class InteractionStreamRenderer:
         call_index = data.get("call_index", 0)
         self._call_index = call_index
         self._has_content_in_current_call = False
+        self._thinking_in_current_call = False
+        self._current_call_text = ""
         if call_index >= 1:
             with self._lock:
                 self.console.print(f"\n• 第 {call_index} 轮推理...", end="")
@@ -391,26 +405,49 @@ class InteractionStreamRenderer:
         if not delta:
             return
         self._has_content_in_current_call = True
+        self._current_call_text += delta
+
         with self._lock:
-            if not self._answer_started:
-                # 如果之前显示了"第 N 轮推理..."，先换行
-                if self._call_index >= 1:
-                    self.console.print()
-                self.console.print("\n🤖 ", end="")
-                self._answer_started = True
-            self.console.print(delta, end="", soft_wrap=True)
+            if not self._thinking_in_current_call:
+                self._thinking_in_current_call = True
+                self.console.print()  # 换行，和"第 N 轮推理..."分开
+
+            # 第1轮（无前序工具调用）：直接白色流式输出
+            if self._call_index == 1 and not self._prev_call_had_tool_calls:
+                if not self._has_streamed_final_answer:
+                    self._has_streamed_final_answer = True
+                    self.console.print("🤖 ", end="", soft_wrap=True)
+                self.console.print(delta, end="", soft_wrap=True)
+            else:
+                # 中间轮次：灰色流式输出
+                self.console.print(f"[dim]{delta}[/dim]", end="", soft_wrap=True)
 
     def on_llm_end(self, data: dict):
         self._input_tokens += int(data.get("input_tokens", 0))
         self._output_tokens += int(data.get("output_tokens", 0))
         self._total_tokens += int(data.get("total_tokens", 0))
-        
-        # 如果本轮没有内容输出，且之前显示了"第 N 轮推理..."，则清除它
-        if not self._has_content_in_current_call and self._call_index >= 1:
-            with self._lock:
-                # 空响应时显示提示（仅在展开模式下）
+
+        has_tool_calls = data.get("has_tool_calls", False)
+
+        with self._lock:
+            # 推理文本结束时换行
+            if self._thinking_in_current_call:
+                self.console.print()
+
+            # 本轮没有 tool_calls 且之前有工具调用 → 这是最终回答
+            # 用白色重新输出（覆盖之前的灰色）
+            if (not has_tool_calls
+                    and self._prev_call_had_tool_calls
+                    and self._current_call_text.strip()):
+                self._has_streamed_final_answer = True
+                self.console.print(f"\n🤖 {self._current_call_text}")
+
+            # 如果本轮没有内容输出
+            if not self._has_content_in_current_call and self._call_index >= 1:
                 if self._expanded:
                     self.console.print(" [dim](空响应)[/dim]")
+
+        self._prev_call_had_tool_calls = has_tool_calls
 
     def on_tool_start(self, data: dict):
         tool = data.get("tool", "Unknown")
@@ -469,7 +506,7 @@ class InteractionStreamRenderer:
 
     def finish(self):
         with self._lock:
-            if self._answer_started:
+            if self._has_streamed_final_answer:
                 self.console.print()
             elapsed = time.perf_counter() - self._started_at
             if self._total_tokens > 0:
@@ -479,7 +516,7 @@ class InteractionStreamRenderer:
             else:
                 self.console.print(f"[dim]({elapsed:.1f}s)[/dim]")
             # 如果简略模式且显示了工具执行，补一个换行
-            if not self._expanded and self._answer_started:
+            if not self._expanded and self._has_streamed_final_answer:
                 self.console.print()  # 让工具行后面的输出更清晰
 
     def reset_between_iterations(self):

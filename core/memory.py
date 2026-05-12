@@ -321,14 +321,16 @@ class MemoryManager:
         # 1. CLAUDE.md
         if os.path.exists(self._claude_md):
             try:
-                parts.append(open(self._claude_md, encoding="utf-8").read())
+                with open(self._claude_md, encoding="utf-8") as f:
+                    parts.append(f.read())
             except Exception:
                 pass
 
         # 2. MEMORY.md
         if os.path.exists(self._memory_md):
             try:
-                parts.append(open(self._memory_md, encoding="utf-8").read())
+                with open(self._memory_md, encoding="utf-8") as f:
+                    parts.append(f.read())
             except Exception:
                 pass
 
@@ -401,6 +403,7 @@ class MemoryManager:
 - 安装依赖：Bash(command="pip install ...")
 - Git 操作：Bash(command="git status")
 - 任何需要修改文件系统或运行命令的操作都必须使用此工具
+- 【禁止】不要用 Bash 执行 curl/wget 来搜索互联网或抓取网页，必须使用 WebSearch 和 WebFetch 工具
 
 ### Write 工具（写入文件）
 - 创建新文件：Write(path="<file_path>", content="<file_content>")
@@ -434,4 +437,49 @@ class MemoryManager:
 **何时使用：**
 - 用户要求索引工作区时（/index 命令）
 - 代码有重大变更后需要重新索引
-- 首次使用 SearchCode 前确保已索引"""
+- 首次使用 SearchCode 前确保已索引
+
+### WebSearch 工具（联网搜索）
+
+**【优先级最高】用户要求搜索/查询互联网信息时，必须使用此工具，禁止用 Bash+curl 替代。**
+
+**何时使用：**
+- 用户询问最新信息（最新版本、近期事件、时事新闻）
+- 用户询问人物信息（"xxx 是谁"、"搜索 xxx 的信息"）
+- 你的训练数据中没有相关信息，或信息可能已过时
+- 用户明确要求"搜一下"、"查一下"、"最新"等关键词
+- 技术文档、release notes、官方公告等需要实时获取的内容
+
+**使用方式：**
+- query: 搜索关键词（如"Java 21 新特性"、"Spring Boot 3.4 release notes"）
+- top_k: 返回结果数量（默认5）
+
+### WebFetch 工具（网页抓取）
+
+**何时使用：**
+- 用户要求查看某个具体网页的内容（"帮我看看 xxx.com 首页"）
+- 需要获取搜索结果中某个 URL 的详细内容
+- 读取在线文档、博客文章、技术教程
+
+**使用方式：**
+- url: 完整 URL（如"https://spring.io/blog/2024/01/spring-boot-3.4"）
+- max_chars: 最大字符数（默认8000）
+
+### 联网搜索组合策略
+
+**场景1：纯搜索** — 用户问"Java 21 有什么新特性"
+→ 直接调用 WebSearch(query="Java 21 新特性")
+
+**场景2：纯抓取** — 用户问"帮我看看 paicoding.com 首页有什么内容"
+→ 直接调用 WebFetch(url="https://paicoding.com")
+
+**场景3：先搜再抓** — 用户问"搜一下 Spring Boot 3.4 的 release notes，然后帮我总结要点"
+→ 第一步：WebSearch(query="Spring Boot 3.4 release notes")
+→ 从搜索结果中找到官方 URL
+→ 第二步：WebFetch(url="找到的官方URL")
+→ 基于抓取内容总结要点
+
+**重要原则：**
+- 不要在不需要联网时调用联网工具（浪费时间和资源）
+- 搜索结果已包含摘要，如果摘要足够回答问题，不需要再抓取
+- 抓取失败时（JS 渲染/反爬），不要反复重试，改用搜索结果或告知用户"""

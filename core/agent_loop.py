@@ -44,9 +44,11 @@ MAX_CONSECUTIVE_TOOL_FAILURES = 2
 
 COMPLEXITY_PROMPT = (
     "判断以下任务的复杂度，只回复一个词：simple 或 complex\n\n"
-    "simple：简单查询、单步操作、单文件修改、简单问答、查看文件、搜索代码\n"
-    "complex：多步骤任务、创建项目、多文件创建/修改、需要规划和审查的任务、"
-    "涉及多种工具配合的任务\n\n"
+    "simple：简单查询、单步操作、单文件修改、简单问答、查看文件、搜索代码、"
+    "搜索互联网信息、查看网页内容、抓取网页、查找资料、获取信息\n"
+    "complex：创建项目、多文件创建/修改、需要规划和审查的任务、"
+    "涉及多种工具配合的任务、重构代码、实现新功能\n\n"
+    "注意：搜索和查看网页是简单任务，不要判为 complex\n\n"
     "任务："
 )
 
@@ -113,15 +115,17 @@ class AgentLoop:
 
     @staticmethod
     def _check_tool_availability(tool) -> tuple[bool, str]:
-        """检查工具是否在当前运行环境可用。"""
+        """检查工具是否在当前运行环境可用。
+
+        WebSearch 支持多种搜索引擎（Tavily/SearXNG/DuckDuckGo），
+        通过 SearchProviderFactory 自动检测，任一可用即可。
+        """
         tool_name = getattr(tool, "name", "")
         if tool_name == "WebSearch":
-            try:
-                import tavily  # noqa: F401
-            except Exception:
-                return False, "缺少 tavily-python 依赖"
-            if not os.environ.get("TAVILY_API_KEY"):
-                return False, "未配置环境变量 TAVILY_API_KEY"
+            from web.providers.factory import SearchProviderFactory
+            provider = SearchProviderFactory.create()
+            if not provider.is_ready():
+                return False, "无可用搜索引擎（需配置 TAVILY_API_KEY、SEARXNG_URL 或安装 duckduckgo-search）"
         return True, ""
 
     def _check_hitl_approval(self, tool_name: str, tool_args: dict):
@@ -387,33 +391,26 @@ class AgentLoop:
     def _plan_or_react(self, state: AgentState) -> dict:
         """路由决策：走 ReAct 还是 Plan-Execute。
 
-        判断逻辑：
-        1. force_plan_mode 为 True → 走 Plan
-        2. LLM 产生多个 tool_calls 且无依赖关系 → 走 Plan
-        3. 其他情况 → 走 ReAct
+        策略：只有 force_plan_mode 时走 Plan，其他都走 ReAct。
         """
         if self.force_plan_mode:
             return {"plan": None}
-
-        last_message = state["messages"][-1]
-        if isinstance(last_message, AIMessage) and last_message.tool_calls:
-            tool_calls = last_message.tool_calls
-            # 多个独立工具调用 → 适合 Plan-Execute
-            if len(tool_calls) > 1:
-                return {"plan": None}
-
         return {}
 
     def _choose_path(self, state: AgentState) -> str:
-        """根据路由决策选择执行路径。"""
+        """选择执行路径。
+
+        策略：
+        - force_plan_mode → plan（用户显式请求）
+        - 其他 → react（逐步执行，稳定可靠）
+
+        不再根据 tool_calls 数量判断，因为：
+        1. LLM 产生 tool_calls 数量不稳定
+        2. 多个 tool_calls 可能有依赖关系，应逐步执行
+        3. Plan/Multi-Agent 对简单任务太重
+        """
         if self.force_plan_mode:
             return "plan"
-
-        last_message = state["messages"][-1]
-        if isinstance(last_message, AIMessage) and last_message.tool_calls:
-            if len(last_message.tool_calls) > 1:
-                return "plan"
-
         return "react"
 
     def _check_permissions(self, state: AgentState) -> dict:
@@ -649,8 +646,10 @@ class AgentLoop:
         return {"messages": tool_messages}
 
     def _plan(self, state: AgentState) -> dict:
-        """生成执行计划。"""
-        # 从对话历史中提取用户目标
+        """生成执行计划。
+
+        如果 LLM 已给出 tool_calls，直接用它们构建计划，避免 Planner 重新生成时丢失参数。
+        """
         user_messages = [
             m for m in state["messages"] if isinstance(m, HumanMessage)
         ]
@@ -661,34 +660,46 @@ class AgentLoop:
                 "goal": goal,
             })
 
-        # 如果 LLM 已经给出了 tool_calls，将其转化为目标描述
         last_message = state["messages"][-1]
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
-            tool_descriptions = []
-            for tc in last_message.tool_calls:
-                tool_descriptions.append(f"- {tc['name']}({tc['args']})")
-            goal = f"{goal}\n需要执行以下操作：\n" + "\n".join(tool_descriptions)
+            # LLM 已给出完整 tool_calls → 直接构建计划，不重新生成
+            plan = self._build_plan_from_tool_calls(goal, last_message.tool_calls)
+            logger.info(f"从 tool_calls 直接构建计划: {plan.id}, 共 {len(plan.tasks)} 个任务")
+        else:
+            # 无 tool_calls → 调用 Planner 生成
+            try:
+                plan = self.planner.create_plan(goal)
+            except Exception as e:
+                logger.error(f"计划生成失败: {e}")
+                if self.hook_manager:
+                    self.hook_manager.emit("PlanError", {"error": str(e)})
+                return {
+                    "messages": [AIMessage(content=f"计划生成失败: {e}")],
+                    "plan": None,
+                }
 
-        try:
-            plan = self.planner.create_plan(goal)
-            plan_dict = plan.model_dump()
-            if self.hook_manager:
-                self.hook_manager.emit("PlanCreated", {
-                    "plan_id": plan.id,
-                    "task_count": len(plan.tasks),
-                })
-            logger.info(f"计划生成完成: {plan.id}, 共 {len(plan.tasks)} 个任务")
-            return {"plan": plan_dict}
-        except Exception as e:
-            logger.error(f"计划生成失败: {e}")
-            if self.hook_manager:
-                self.hook_manager.emit("PlanError", {
-                    "error": str(e),
-                })
-            return {
-                "messages": [AIMessage(content=f"计划生成失败: {e}")],
-                "plan": None,
-            }
+        plan_dict = plan.model_dump()
+        if self.hook_manager:
+            self.hook_manager.emit("PlanCreated", {
+                "plan_id": plan.id,
+                "task_count": len(plan.tasks),
+            })
+        logger.info(f"计划生成完成: {plan.id}, 共 {len(plan.tasks)} 个任务")
+        return {"plan": plan_dict}
+
+    def _build_plan_from_tool_calls(self, goal: str, tool_calls: list) -> Plan:
+        """将 LLM 产生的 tool_calls 直接转换为 Plan，保留原始参数。"""
+        from core.plan_models import Task
+        tasks = []
+        for i, tc in enumerate(tool_calls, 1):
+            tasks.append(Task(
+                id=f"task_{i}",
+                description=f"执行 {tc['name']}({tc['args']})",
+                tool_name=tc["name"],
+                tool_args=tc["args"],
+                dependencies=[],
+            ))
+        return Plan(goal=goal, tasks=tasks)
 
     def _execute_plan(self, state: AgentState) -> dict:
         """执行已生成的计划。"""

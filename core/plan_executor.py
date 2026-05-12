@@ -128,6 +128,18 @@ class PlanExecutor:
             # 构建工具输入
             tool_input = self._normalize_tool_args(tool, task.tool_args or {})
 
+            # 检查必填参数是否齐全
+            missing = self._check_required_args(tool, tool_input)
+            if missing:
+                task.mark_failed(
+                    error=f"工具 {task.tool_name} 缺少必填参数: {', '.join(missing)}"
+                )
+                logger.error(
+                    "任务 %s 参数不完整: tool=%s, missing=%s, got=%s",
+                    task.id, task.tool_name, missing, tool_input,
+                )
+                return
+
             # PreToolUse Hook
             if self.hook_manager:
                 self.hook_manager.emit("PreToolUse", {
@@ -154,6 +166,30 @@ class PlanExecutor:
             logger.error(f"任务 {task.id} 执行失败: {e}")
             task.mark_failed(error=str(e))
             self._propagate_failure(task, plan)
+
+    def _check_required_args(self, tool, tool_input: dict) -> list:
+        """检查工具必填参数是否齐全，返回缺失的参数名列表。"""
+        # @tool 装饰器创建的工具，参数定义在 input_schema 中
+        schema = getattr(tool, "input_schema", None) or getattr(tool, "args_schema", None)
+        if schema is None:
+            return []
+
+        if hasattr(schema, "model_fields"):
+            # Pydantic v2
+            required = [
+                name for name, field in schema.model_fields.items()
+                if field.is_required()
+            ]
+        elif hasattr(schema, "__fields__"):
+            # Pydantic v1
+            required = [
+                name for name, field in schema.__fields__.items()
+                if field.required
+            ]
+        else:
+            return []
+
+        return [name for name in required if name not in tool_input]
 
     def _normalize_tool_args(self, tool, tool_args: dict) -> dict:
         """按工具 _run 签名规范化参数，兼容常见别名并过滤无效参数。"""

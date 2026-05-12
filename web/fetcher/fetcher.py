@@ -5,6 +5,7 @@
 2. httpx 发起 HTTP GET（支持 SSL 回退）
 3. 响应体截断（防 OOM）
 4. HtmlExtractor 提取正文转 Markdown
+5. 正文为空时降级提取 meta 信息（SPA 页面兜底）
 """
 
 import logging
@@ -67,6 +68,22 @@ class WebFetcher:
         # 提取正文
         if extract_content:
             extracted = self._extractor.extract(content)
+
+            # 正文为空时降级提取 meta 信息（SPA 页面兜底）
+            if not extracted or extracted.startswith("未提取到正文"):
+                meta_info = self._extract_meta_fallback(content)
+                if meta_info:
+                    extracted = (
+                        f"⚠ 该页面为 JS 渲染的 SPA 应用，无法提取正文内容。\n"
+                        f"建议使用 WebSearch 搜索该网站信息，不要重试 WebFetch。\n\n"
+                        f"从页面 HTML 源码中提取的元信息：\n{meta_info}"
+                    )
+                else:
+                    extracted = (
+                        "⚠ 该页面为 JS 渲染或防爬页面，无法提取任何内容。\n"
+                        "请改用 WebSearch 搜索该网站信息，不要重试 WebFetch。"
+                    )
+
             return {"title": title, "content": extracted, "url": str(resp.url)}
         else:
             return {"title": title, "content": content, "url": str(resp.url)}
@@ -107,3 +124,49 @@ class WebFetcher:
         soup = BeautifulSoup(html, "html.parser")
         title_tag = soup.find("title")
         return title_tag.get_text(strip=True) if title_tag else ""
+
+    @staticmethod
+    def _extract_meta_fallback(html: str) -> str:
+        """SPA 页面降级：从 HTML 源码提取 meta 信息。
+
+        提取：<title>、<meta description>、<meta og:title/description/url>、
+        <noscript> 内容、<link rel="alternate"> 等。
+        """
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+
+        parts = []
+
+        # title
+        title = soup.find("title")
+        if title and title.get_text(strip=True):
+            parts.append(f"标题: {title.get_text(strip=True)}")
+
+        # meta description
+        desc = soup.find("meta", attrs={"name": "description"})
+        if desc and desc.get("content"):
+            parts.append(f"描述: {desc['content']}")
+
+        # Open Graph 标签
+        for tag_name in ["og:title", "og:description", "og:site_name", "og:url"]:
+            og = soup.find("meta", attrs={"property": tag_name})
+            if og and og.get("content"):
+                label = tag_name.replace("og:", "")
+                parts.append(f"{label}: {og['content']}")
+
+        # noscript 内容（SPA 页面为搜索引擎提供的备用内容）
+        noscript = soup.find("noscript")
+        if noscript:
+            ns_text = noscript.get_text(strip=True)
+            if ns_text and len(ns_text) > 10:
+                preview = ns_text[:300]
+                parts.append(f"noscript 内容: {preview}")
+
+        # link rel="alternate"（RSS、sitemap 等）
+        for link in soup.find_all("link", rel="alternate"):
+            href = link.get("href", "")
+            type_ = link.get("type", "")
+            if href:
+                parts.append(f"alternate({type_}): {href}")
+
+        return "\n".join(parts) if parts else ""

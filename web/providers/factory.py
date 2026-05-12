@@ -3,9 +3,11 @@
 选择逻辑：
 1. config.yaml 中 web.search.provider 显式指定 → 优先
 2. TAVILY_API_KEY 已配 → tavily
-3. SEARXNG_URL 已配 → searxng
-4. duckduckgo-search 已安装 → duckduckgo
-5. 默认 → tavily（占位，调用时会友好提示）
+3. GLM_API_KEY / ZHIPU_API_KEY 已配 → zhipu
+4. SERPAPI_KEY 已配 → serpapi
+5. SEARXNG_URL 已配 → searxng
+6. duckduckgo-search 已安装 → duckduckgo
+7. 默认 → tavily（占位，调用时会友好提示）
 """
 
 import logging
@@ -19,6 +21,8 @@ logger = logging.getLogger(__name__)
 # Provider 名称 → 模块路径映射
 _PROVIDER_MAP = {
     "tavily": "web.providers.tavily.TavilyProvider",
+    "zhipu": "web.providers.zhipu.ZhipuProvider",
+    "serpapi": "web.providers.serpapi.SerpApiProvider",
     "searxng": "web.providers.searxng.SearXNGProvider",
     "duckduckgo": "web.providers.duckduckgo.DuckDuckGoProvider",
 }
@@ -42,7 +46,7 @@ class SearchProviderFactory:
             return cls._instance
 
         # 自动检测：按优先级尝试各 Provider
-        for candidate in ["tavily", "searxng", "duckduckgo"]:
+        for candidate in ["tavily", "zhipu", "serpapi", "searxng", "duckduckgo"]:
             provider = cls._create_by_name(candidate)
             if provider.is_ready():
                 logger.info("自动选择搜索引擎: %s", candidate)

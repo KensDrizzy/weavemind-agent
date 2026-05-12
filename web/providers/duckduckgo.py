@@ -21,19 +21,26 @@ class DuckDuckGoProvider(SearchProvider):
 
     def is_ready(self) -> bool:
         try:
-            import duckduckgo_search  # noqa: F401
+            from ddgs import DDGS  # noqa: F401
             return True
         except ImportError:
-            return False
+            try:
+                from duckduckgo_search import DDGS  # noqa: F401
+                return True
+            except ImportError:
+                return False
 
     def unavailable_hint(self) -> str:
         return (
-            "WebSearch 不可用：请安装 duckduckgo-search\n"
-            "  pip install duckduckgo-search"
+            "WebSearch 不可用：请安装 ddgs\n"
+            "  pip install ddgs"
         )
 
     def search(self, query: str, top_k: int = 5) -> List[SearchResult]:
-        from duckduckgo_search import DDGS
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
 
         results = []
         try:

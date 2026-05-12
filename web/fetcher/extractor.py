@@ -20,10 +20,10 @@ from bs4 import BeautifulSoup, Tag
 
 logger = logging.getLogger(__name__)
 
-# 需要清理的噪声标签
+# 需要清理的噪声标签（注意：noscript 不删除，作为 SPA 页面的备用内容）
 _NOISE_TAGS = {
     "script", "style", "nav", "aside", "footer", "header",
-    "form", "iframe", "noscript", "svg", "canvas",
+    "form", "iframe", "svg", "canvas",
 }
 
 # 噪声关键词（class/id 中包含这些词的元素会被清理）
@@ -79,8 +79,14 @@ class HtmlExtractor:
         """优先找语义化标签。"""
         for selector in ["article", "main", "[role='main']"]:
             result = soup.select_one(selector)
-            if result and len(result.get_text(strip=True)) > 100:
+            if result and len(result.get_text(strip=True)) > 20:
                 return result
+        
+        # 兜底：找 noscript 标签（SPA 页面的备用内容）
+        noscript = soup.find("noscript")
+        if noscript and len(noscript.get_text(strip=True)) > 20:
+            return noscript
+        
         return None
 
     def _score_and_pick(self, soup: BeautifulSoup) -> Optional[Tag]:
@@ -103,7 +109,7 @@ class HtmlExtractor:
         text = el.get_text(strip=True)
         text_len = len(text)
 
-        if text_len < 80:
+        if text_len < 50:
             return 0
 
         # 计算链接密度
@@ -173,8 +179,11 @@ class HtmlExtractor:
                     if child.find("th"):
                         lines.append("| " + " | ".join("---" for _ in cells) + " |")
 
-        # 去重连续空行
+        # 如果没有提取到任何结构化内容，回退到纯文本
         result = "\n".join(lines)
+        if not result.strip():
+            result = el.get_text(separator="\n", strip=True)
+
         while "\n\n\n" in result:
             result = result.replace("\n\n\n", "\n\n")
 
