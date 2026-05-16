@@ -2,10 +2,14 @@
 
 支持两种模式：
 - Anthropic 原生端点 → ChatAnthropic
-- OpenAI 兼容端点（MiMo、DeepSeek 等）→ ChatOpenAI
+- OpenAI 兼容端点（MiMo、DeepSeek 等）→ ChatOpenAI / MiMoChatOpenAI
 """
 
 import logging
+from typing import Optional
+
+from langchain_openai import ChatOpenAI
+
 import settings
 
 logger = logging.getLogger(__name__)
@@ -45,9 +49,81 @@ def create_llm(provider: str = None, model: str = None, max_tokens: int = 4096):
         return _create_anthropic(use_model, base_url, api_key, max_tokens)
 
 
+class MiMoChatOpenAI(ChatOpenAI):
+    """ChatOpenAI 子类 — 从原始 API 响应中捕获 MiMo 的 reasoning_content。
+
+    MiMo thinking 模式返回的 reasoning_content 被 LangChain 丢弃，
+    此子类在 _create_chat_result 中拦截原始响应，将其保存到 additional_kwargs。
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._last_reasoning_content: Optional[str] = None
+
+    def _create_chat_result(self, response, generation_info=None):
+        # 先从原始响应中提取 reasoning_content（在 LangChain 丢弃之前）
+        reasoning_by_index = {}
+        if hasattr(response, "choices"):
+            for i, choice in enumerate(response.choices):
+                msg = choice.message
+                if hasattr(msg, "reasoning_content") and msg.reasoning_content:
+                    reasoning_by_index[i] = msg.reasoning_content
+
+        # 调用父类完成正常转换
+        result = super()._create_chat_result(response, generation_info)
+
+        # 将 reasoning_content 注入回 AIMessage 的 additional_kwargs
+        for i, reasoning in reasoning_by_index.items():
+            if i < len(result.generations):
+                gen = result.generations[i]
+                if hasattr(gen, "message") and hasattr(gen.message, "additional_kwargs"):
+                    gen.message.additional_kwargs["reasoning_content"] = reasoning
+                    self._last_reasoning_content = reasoning
+
+        return result
+
+    def _stream(self, *args, **kwargs):
+        """禁用 streaming，强制走 invoke → _create_chat_result 路径。
+
+        MiMo thinking 模式的 reasoning_content 在 streaming 路径中被
+        langchain-openai 的 _convert_delta_to_message_chunk 彻底丢弃。
+        禁用 streaming 后，agent_loop 会回退到 invoke()，
+        调用 _create_chat_result → 我们的重写能正确捕获 reasoning_content。
+        """
+        yield from ()
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        """重写消息序列化，确保 reasoning_content 传递到 API 请求。
+
+        LangChain 的 _convert_message_to_dict 不处理 additional_kwargs["reasoning_content"]，
+        导致 MiMo thinking 模式要求的 reasoning_content 在序列化时被丢弃。
+        此方法在父类完成序列化后，将 reasoning_content 注入回消息 dict。
+        """
+        from langchain_core.messages import AIMessage
+
+        # 先将输入转为 BaseMessage 列表，记录每个 AIMessage 的 reasoning_content
+        messages = self._convert_input(input_).to_messages()
+        reasoning_map = {}
+        for i, m in enumerate(messages):
+            if isinstance(m, AIMessage):
+                rc = m.additional_kwargs.get("reasoning_content")
+                if rc:
+                    reasoning_map[i] = rc
+
+        # 调用父类生成 payload（消息被序列化为 dict）
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+
+        # 将 reasoning_content 注入到序列化后的消息 dict 中
+        msg_list = payload.get("messages", [])
+        for i, rc in reasoning_map.items():
+            if i < len(msg_list) and isinstance(msg_list[i], dict) and msg_list[i].get("role") == "assistant":
+                msg_list[i]["reasoning_content"] = rc
+
+        return payload
+
+
 def _create_openai_compat(model, base_url, api_key, max_tokens):
     """创建 OpenAI 兼容端点的 LLM 实例。"""
-    from langchain_openai import ChatOpenAI
 
     # 将 Anthropic 兼容路径转换为 OpenAI 兼容路径
     openai_url = base_url
@@ -56,14 +132,21 @@ def _create_openai_compat(model, base_url, api_key, max_tokens):
     elif not openai_url.endswith("/v1"):
         openai_url = openai_url.rstrip("/") + "/v1"
 
+    is_mimo = "xiaomimimo" in openai_url or "mimo" in model.lower()
+
     logger.info(f"使用 OpenAI 兼容端点: {openai_url}, model={model}")
-    return ChatOpenAI(
-        model=model,
-        base_url=openai_url,
-        api_key=api_key,
-        max_tokens=max_tokens,
-        temperature=0.7,
-    )
+    kwargs = {
+        "model": model,
+        "base_url": openai_url,
+        "api_key": api_key,
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
+    # MiMo 模型需要开启 thinking 模式（返回 reasoning_content）
+    if is_mimo:
+        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+        return MiMoChatOpenAI(**kwargs)
+    return ChatOpenAI(**kwargs)
 
 
 def _create_anthropic(model, base_url, api_key, max_tokens):

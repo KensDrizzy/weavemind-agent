@@ -96,7 +96,7 @@ class WeaveMindCLI:
         # 创建命令补全器
         commands = [
             "/help", "/memory", "/save", "/sessions", "/mode", "/plan", "/team",
-            "/hitl", "/mcp", "/index", "/search", "/clear", "/exit", "/quit"
+            "/hitl", "/mcp", "/browser", "/index", "/search", "/clear", "/exit", "/quit"
         ]
         completer = FuzzyCompleter(WordCompleter(commands, ignore_case=True))
         key_bindings = self._build_key_bindings()
@@ -142,6 +142,8 @@ class WeaveMindCLI:
             rag_pipeline=self.rag_pipeline,
             mcp_manager=self.mcp_manager if self._mcp_initialized else None,
         )
+        # 让 MCPManager 持有 ToolRegistry 引用，以便模式切换时同步更新
+        self.mcp_manager._tool_registry = self.tool_registry
         self._direct_intent = DirectIntentHandler(self.tool_registry)
         self.agent_loop = AgentLoop(
             tool_registry=self.tool_registry,
@@ -149,6 +151,7 @@ class WeaveMindCLI:
             hook_manager=self.hook_manager,
             memory=self.memory,
             force_plan_mode=force_plan,
+            mcp_manager=self.mcp_manager if self._mcp_initialized else None,
         )
 
     def _init_mcp_sync(self):
@@ -188,7 +191,15 @@ class WeaveMindCLI:
                 # MCP 初始化后重建 AgentLoop（含 MCP 工具）
                 self._create_agent_loop()
 
+                # 注入 BrowserGuard 到 PermissionPolicy
+                browser_guard = self.mcp_manager.get_browser_guard()
+                if browser_guard:
+                    self.permission_policy.set_browser_guard(browser_guard)
+
                 # 显示 MCP 工具信息
+                provider = settings.get("llm.provider", "mimo")
+                model = settings.get("llm.model", "unknown")
+                console.print(f"[dim]🧠 Model: {provider}/{model}[/dim]")
                 mcp_info = self.mcp_manager.get_tools_info()
                 if mcp_info:
                     console.print("\n[dim]📡 MCP Servers:[/dim]")
@@ -227,20 +238,19 @@ class WeaveMindCLI:
         return complexity == "complex"
 
     def _print_banner(self):
-        """打印启动欢迎界面（立体文）。"""
-        banner = """
-╭─────────────────────────────────────────────────────────────╮
-│                                                             │
-│  ██╗    ██╗███████╗ █████╗ ██╗   ██╗███████╗███╗   ███╗██╗ │
-│  ██║    ██║██╔════╝██╔══██╗██║   ██║██╔════╝████╗ ████║██║ │
-│  ██║ █╗ ██║█████╗  ███████║██║   ██║█████╗  ██╔████╔██║██║ │
-│  ██║███╗██║██╔══╝  ██╔══██║██║   ██║██╔══╝  ██║╚██╔╝██║██║ │
-│  ╚███╔███╝███████╗██║  ██║╚██████╔╝███████╗██║ ╚═╝ ██║██║ │
-│   ╚══╝╚══╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝     ╚═╝╚═╝ │
-│                                                             │
-│              [cyan]智能代码助手 | LangGraph 驱动[/cyan]         │
-│                                                             │
-╰─────────────────────────────────────────────────────────────╯
+        """打印启动欢迎界面。"""
+        banner = r"""
+╭───────────────────────────────────────────────────────────────────────────────╮
+│                                                                               │
+│  [bold cyan]██     ██ ███████  █████  ██    ██ ███████ ███    ███ ██ ███    ██ ██████ [/bold cyan]   │
+│  [cyan]██     ██ ██      ██   ██ ██    ██ ██      ████  ████ ██ ████   ██ ██   ██[/cyan]   │
+│  [cyan]██  █  ██ █████   ███████ ██    ██ █████   ██ ████ ██ ██ ██ ██  ██ ██   ██[/cyan]   │
+│  [cyan]██ ███ ██ ██      ██   ██  ██  ██  ██      ██  ██  ██ ██ ██  ██ ██ ██   ██[/cyan]   │
+│  [cyan] ███ ███  ███████ ██   ██   ████   ███████ ██      ██ ██ ██   ████ ██████ [/cyan]   │
+│                                                                               │
+│                                [dim]AGENT CLI[/dim]                                          │
+│                                                                               │
+╰───────────────────────────────────────────────────────────────────────────────╯
 """
         console.print(banner)
 
@@ -254,7 +264,7 @@ class WeaveMindCLI:
         
         console.print(Panel(
             "[bold]WeaveMind Agent[/bold]\n"
-            "输入问题开始对话 | /help 查看命令 | /plan 切换规划模式",
+            "输入问题开始对话 | /help 查看命令 ",
             border_style="blue",
             padding=(1, 2),
         ))
@@ -437,8 +447,11 @@ class WeaveMindCLI:
             if final_ai_message:
                 # 检查是否为空响应
                 content = getattr(final_ai_message, "content", "")
-                if content and content.strip():
-                    if not self.stream_renderer.has_streamed_answer:
+                has_reasoning = bool(
+                    getattr(final_ai_message, "additional_kwargs", {}).get("reasoning_content")
+                )
+                if (content and content.strip()) or has_reasoning:
+                    if content and content.strip() and not self.stream_renderer.has_streamed_answer:
                         console.print(f"\n🤖 {content}")
                     self.conversation.append(final_ai_message)
                 else:

@@ -71,6 +71,7 @@ class AgentLoop:
         provider: str = None,
         model: str = None,
         force_plan_mode: bool = False,
+        mcp_manager=None,
     ):
         self.tool_registry = tool_registry
         self.permission_policy = permission_policy
@@ -79,11 +80,13 @@ class AgentLoop:
         self.provider = provider
         self.model = model
         self.force_plan_mode = force_plan_mode
+        self.mcp_manager = mcp_manager
         self.mode = "default"  # 权限模式，可选: default, ask, acceptEdits, bypassPermissions
         self._model_call_count = 0
         self._tool_unavailable_reasons: dict[str, str] = {}
         self._tool_failure_counts: dict[str, int] = {}
         self._disabled_tools: dict[str, str] = {}
+        self._auto_switched_to_shared = False  # 本轮是否已自动切换到 shared
 
         self.llm = create_llm(provider, model)
         self.tools = self._filter_available_tools(tool_registry.get_langchain_tools())
@@ -128,6 +131,49 @@ class AgentLoop:
                 return False, "无可用搜索引擎（需配置 TAVILY_API_KEY、SEARXNG_URL 或安装 duckduckgo-search）"
         return True, ""
 
+    # ── MiMo reasoning_content 回传支持 ──────────────────────────
+
+    def _preserve_reasoning_content(self, response):
+        """从 LLM 响应中捕获 reasoning_content 并存入 additional_kwargs。
+
+        MiMo 的 thinking 模式会在 assistant 消息中返回 reasoning_content，
+        但 LangChain 不认识该字段，序列化时会丢失。
+        MiMoChatOpenAI 子类已将 reasoning_content 存入 additional_kwargs，
+        此方法做兜底检查，并处理 streaming 场景下保存在 LLM 实例上的值。
+        """
+        if not isinstance(response, AIMessage):
+            return
+
+        # reasoning_content 可能在不同位置，依次检查
+        reasoning = getattr(response, "reasoning_content", None)
+        if reasoning is None:
+            reasoning = response.additional_kwargs.get("reasoning_content")
+        if reasoning is None:
+            meta = getattr(response, "response_metadata", None) or {}
+            reasoning = meta.get("reasoning_content")
+
+        # 兜底：检查 LLM 实例上保存的 streaming reasoning_content
+        if reasoning is None:
+            llm = getattr(self, "llm", None)
+            if llm is not None:
+                reasoning = getattr(llm, "_last_reasoning_content", None)
+                if reasoning:
+                    llm._last_reasoning_content = None  # 用完即清
+
+        if reasoning:
+            response.additional_kwargs["reasoning_content"] = reasoning
+            logger.debug("已捕获 reasoning_content (%d 字符)", len(str(reasoning)))
+
+    @staticmethod
+    def _inject_reasoning_content(messages: list) -> list:
+        """reasoning_content 回传现在由 MiMoChatOpenAI._get_request_payload 处理。
+
+        此方法保留为空操作，避免影响非 MiMo provider 的逻辑。
+        MiMoChatOpenAI 在消息序列化阶段会自动将 additional_kwargs["reasoning_content"]
+        注入到 API 请求的 assistant 消息中。
+        """
+        return messages
+
     def _check_hitl_approval(self, tool_name: str, tool_args: dict):
         """检查工具是否需要 HITL 审批，如需要则发起审批流程。
 
@@ -152,6 +198,7 @@ class AgentLoop:
         self._model_call_count = 0
         self._tool_failure_counts = {}
         self._disabled_tools = {}
+        self._auto_switched_to_shared = False
 
     def _record_tool_failure(self, tool_name: str, error: str):
         """记录工具失败次数，超过阈值后本轮禁用。"""
@@ -230,6 +277,9 @@ class AgentLoop:
                 "call_index": call_index,
             })
 
+        # MiMo reasoning_content 回传：将之前保存的 reasoning_content 注入回消息
+        messages = self._inject_reasoning_content(list(messages))
+
         full_chunk = None
         stream_failed = False
         emitted_any_delta = False
@@ -258,6 +308,9 @@ class AgentLoop:
                     })
         else:
             response = message_chunk_to_message(full_chunk)
+
+        # MiMo reasoning_content 捕获：保存 thinking 内容以便后续回传
+        self._preserve_reasoning_content(response)
 
         input_tokens, output_tokens, total_tokens = self._extract_usage(response)
         if self.hook_manager:
@@ -304,7 +357,14 @@ class AgentLoop:
                 # 防止重试结果带 tool_calls 导致 graph 多绕一圈
                 retry_text = self._extract_text_content(getattr(retry_response, "content", ""))
                 if retry_text:
-                    response = AIMessage(content=retry_text)
+                    # 保留重试响应的 reasoning_content（如有）
+                    retry_kwargs = {}
+                    retry_rc = getattr(retry_response, "reasoning_content", None)
+                    if retry_rc is None and hasattr(retry_response, "additional_kwargs"):
+                        retry_rc = retry_response.additional_kwargs.get("reasoning_content")
+                    if retry_rc:
+                        retry_kwargs["reasoning_content"] = retry_rc
+                    response = AIMessage(content=retry_text, additional_kwargs=retry_kwargs)
                     if self.hook_manager:
                         self.hook_manager.emit("LLMDelta", {
                             "call_index": call_index,
@@ -637,6 +697,16 @@ class AgentLoop:
                     "result": str(result)[:500],
                 })
 
+            # ── 自动检测登录页并切换到 shared 模式 ──────────────────
+            if not had_error and self.mcp_manager and not self._auto_switched_to_shared:
+                result_str = str(result)
+                switched, switch_msg = self._try_auto_switch_on_login(
+                    tool_name, result_str, tool_args
+                )
+                if switched:
+                    # 切换成功，在结果中追加提示让 Agent 重试
+                    result = f"{result_str}\n\n{switch_msg}"
+
             from langchain_core.messages import ToolMessage
             tool_messages.append(ToolMessage(
                 content=str(result),
@@ -644,6 +714,144 @@ class AgentLoop:
             ))
 
         return {"messages": tool_messages}
+
+    def _try_auto_switch_on_login(
+        self, tool_name: str, result_str: str, tool_args: dict
+    ) -> tuple[bool, str]:
+        """检测 Chrome 工具结果是否包含登录页，自动切换到 shared 模式。
+
+        触发条件：
+        1. 工具是 Chrome DevTools MCP 工具
+        2. 当前处于 isolated 模式
+        3. 结果中检测到登录页特征（URL 或页面内容）
+        4. 本轮尚未自动切换过
+        5. 配置允许自动切换（chrome_mode.auto_switch.on_login_detected=true）
+
+        Returns:
+            (是否已切换, 提示信息)
+        """
+        from mcp_client.chrome_formatter import is_chrome_tool
+
+        # 只检测 Chrome 工具
+        if not is_chrome_tool(tool_name):
+            return False, ""
+
+        # 当前必须是 isolated 模式才有切换的必要
+        if not self.mcp_manager or self.mcp_manager.is_shared_mode():
+            return False, ""
+
+        # 本轮已切换过，不再重复
+        if self._auto_switched_to_shared:
+            return False, ""
+
+        # 检查配置是否允许自动切换
+        import settings
+        auto_switch_enabled = settings.get("chrome_mode.auto_switch.on_login_detected", True)
+        if not auto_switch_enabled:
+            return False, ""
+
+        # 从工具参数中提取 URL
+        url = tool_args.get("url", "") or tool_args.get("page_url", "")
+
+        # 检测登录页
+        need_login = self.mcp_manager.detect_need_login(result_str, url)
+
+        if not need_login:
+            return False, ""
+
+        logger.info("检测到登录页 (tool=%s, url=%s)，尝试自动切换到 shared 模式",
+                     tool_name, url)
+
+        # 先检查用户 Chrome 是否可用
+        from mcp_client.auto_connect import AutoConnectDiscovery
+        discovery = AutoConnectDiscovery()
+        if not discovery.is_remote_debugging_enabled():
+            # 用户 Chrome 未开启远程调试，提示用户
+            msg = (
+                "[浏览器登录态检测] 当前页面需要登录，但 isolated 模式无登录态。"
+                "如需自动使用你的 Chrome 登录态，请先用远程调试模式启动 Chrome：\n"
+                "  macOS: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222\n"
+                "  然后使用 /browser shared 切换模式。"
+            )
+            logger.info("用户 Chrome 未开启远程调试，无法自动切换")
+            return False, ""
+
+        # 自动切换到 shared 模式
+        success = self._auto_switch_to_shared()
+
+        if success:
+            msg = (
+                "[浏览器自动切换] 检测到登录页，已自动切换到 shared 模式"
+                "（连接你的 Chrome，继承登录态）。"
+                "请重新执行刚才的浏览器操作（如 navigate_page），"
+                "现在应该可以访问需要登录的页面了。"
+            )
+            return True, msg
+        else:
+            msg = (
+                "[浏览器切换失败] 检测到登录页，尝试切换到 shared 模式失败。"
+                "你可以手动使用 /browser shared 切换。"
+            )
+            return False, msg
+
+    def _auto_switch_to_shared(self) -> bool:
+        """同步执行自动切换到 shared 模式。
+
+        使用 MCPManager 的持久事件循环执行 async 切换，
+        切换后刷新 AgentLoop 的工具列表。
+
+        Returns:
+            是否切换成功
+        """
+        import asyncio
+
+        try:
+            # 使用 MCPManager 的持久事件循环
+            loop = None
+            conn = self.mcp_manager.get_connection("chrome")
+            if conn and conn._loop and conn._loop.is_running():
+                loop = conn._loop
+
+            if loop:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.mcp_manager.switch_to_shared(), loop
+                )
+                success = future.result(timeout=30)
+            else:
+                # 降级：直接 asyncio.run
+                success = asyncio.run(self.mcp_manager.switch_to_shared())
+
+            if success:
+                self._auto_switched_to_shared = True
+                # 刷新工具列表（MCP Server 重启后工具可能变化）
+                self._refresh_tools_after_switch()
+                logger.info("已自动切换到 shared 模式并刷新工具列表")
+                return True
+            else:
+                logger.warning("自动切换到 shared 模式失败")
+                return False
+
+        except Exception as e:
+            logger.error("自动切换到 shared 模式异常: %s", e)
+            return False
+
+    def _refresh_tools_after_switch(self):
+        """切换模式后刷新 AgentLoop 的工具列表。
+
+        _re_register_tools 已同步更新 MCPManager._tools 和 ToolRegistry._tools，
+        此方法只需重建 llm_with_tools 即可。
+        """
+        try:
+            # 重建 LLM 绑定的工具
+            self.tools = self._filter_available_tools(
+                self.tool_registry.get_langchain_tools()
+            )
+            self.llm_with_tools = self.llm.bind_tools(self.tools)
+
+            logger.info("工具列表已刷新，当前 %d 个工具可用", len(self.tools))
+
+        except Exception as e:
+            logger.error("刷新工具列表失败: %s", e)
 
     def _plan(self, state: AgentState) -> dict:
         """生成执行计划。

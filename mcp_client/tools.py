@@ -136,9 +136,90 @@ def _format_result(result: Any) -> str:
 
 # ── 动态工具类工厂 ─────────────────────────────────────────────────
 
+
+def _try_auto_switch_to_shared(
+    result_str: str,
+    tool_args: dict,
+    tool_name: str,
+    mcp_manager,
+    format_fn,
+    conn=None,  # 当前 MCPConnection，用于获取事件循环
+) -> str:
+    """检测 Chrome 工具结果是否需要登录，自动切换到 shared 模式并重试。
+
+    如果结果表明需要登录且当前是 isolated 模式，会：
+    1. 通过 session_manager.switch_to_shared() 切换模式
+    2. 获取新的 MCP 连接
+    3. 重新执行工具调用
+
+    只重试一次，避免无限循环。
+    """
+    session_manager = mcp_manager.get_session_manager()
+    if not session_manager or session_manager.is_shared:
+        return result_str
+
+    # 检测是否需要登录
+    url = tool_args.get("url", "")
+    if not session_manager.detect_need_login(result_str, url):
+        return result_str
+
+    logger.info("Chrome 工具 '%s' 检测到需要登录，尝试自动切换到 shared 模式...", tool_name)
+
+    try:
+        # 使用连接的事件循环（与 sync_func 保持一致）
+        loop = getattr(conn, "_loop", None)
+        if loop and loop.is_running():
+            switched = asyncio.run_coroutine_threadsafe(
+                session_manager.switch_to_shared(), loop
+            ).result(timeout=30)
+        else:
+            # 没有持久事件循环时，创建新的
+            loop = asyncio.new_event_loop()
+            try:
+                switched = loop.run_until_complete(
+                    session_manager.switch_to_shared()
+                )
+            finally:
+                loop.close()
+
+        if not switched:
+            logger.warning("自动切换到 shared 模式失败，返回原始结果")
+            return result_str
+
+        # 获取新的连接并重试
+        new_conn = mcp_manager.get_connection("chrome")
+        if not new_conn:
+            logger.warning("切换后未找到新的 Chrome 连接")
+            return result_str
+
+        logger.info("已切换到 shared 模式，重新执行 %s...", tool_name)
+
+        new_loop = getattr(new_conn, "_loop", None)
+        if new_loop and new_loop.is_running():
+            retry_result = asyncio.run_coroutine_threadsafe(
+                new_conn.call_tool(tool_name, tool_args), new_loop
+            ).result(timeout=120)
+        else:
+            loop = asyncio.new_event_loop()
+            try:
+                retry_result = loop.run_until_complete(
+                    new_conn.call_tool(tool_name, tool_args)
+                )
+            finally:
+                loop.close()
+
+        retry_str = format_fn(retry_result)
+        return f"[已自动切换到 shared 模式（连接用户 Chrome）]\n{retry_str}"
+
+    except Exception as e:
+        logger.error("自动切换到 shared 模式出错: %s", e)
+        return result_str
+
+
 def create_mcp_tool_instance(
     tool_info: MCPToolInfo,
     connection,  # MCPConnection 实例
+    mcp_manager=None,  # MCPManager 实例（用于 Chrome 自动切换）
 ) -> WeaveMindTool:
     """
     根据 MCP 工具元数据创建 WeaveMindTool 实例。
@@ -174,7 +255,7 @@ def create_mcp_tool_instance(
             return format_chrome_result(tname, result)
         return _format_result(result)
 
-    # 创建同步调用函数（闭包捕获 conn 和 tname）
+    # 创建同步调用函数（闭包捕获 conn、tname、mcp_manager）
     def sync_func(**kwargs) -> str:
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
@@ -184,7 +265,14 @@ def create_mcp_tool_instance(
                     conn.call_tool(tname, filtered_kwargs), conn._loop
                 )
                 result = future.result(timeout=120)
-                return _format(result)
+                result_str = _format(result)
+
+                # Chrome 工具自动检测登录页 → 切换 shared 模式重试
+                if use_chrome_formatter and mcp_manager:
+                    result_str = _try_auto_switch_to_shared(
+                        result_str, filtered_kwargs, tname, mcp_manager, _format, conn=conn
+                    )
+                return result_str
 
             # 降级：没有持久事件循环时使用 asyncio.run
             loop = asyncio.get_event_loop()
@@ -195,10 +283,20 @@ def create_mcp_tool_instance(
                         asyncio.run, conn.call_tool(tname, filtered_kwargs)
                     )
                     result = future.result(timeout=120)
-                    return _format(result)
+                    result_str = _format(result)
+                    if use_chrome_formatter and mcp_manager:
+                        result_str = _try_auto_switch_to_shared(
+                            result_str, filtered_kwargs, tname, mcp_manager, _format, conn=conn
+                        )
+                    return result_str
             else:
                 result = asyncio.run(conn.call_tool(tname, filtered_kwargs))
-                return _format(result)
+                result_str = _format(result)
+                if use_chrome_formatter and mcp_manager:
+                    result_str = _try_auto_switch_to_shared(
+                        result_str, filtered_kwargs, tname, mcp_manager, _format, conn=conn
+                    )
+                return result_str
         except RuntimeError:
             result = asyncio.run(conn.call_tool(tname, filtered_kwargs))
             return _format(result)

@@ -233,9 +233,10 @@ class TestChromePermissions:
         assert "fill" in CHROME_MODIFY_TOOLS
 
     def test_dangerous_tools_exist(self):
-        from permissions.modes import CHROME_DANGEROUS_TOOLS
+        from permissions.modes import CHROME_DANGEROUS_TOOLS, CHROME_MODIFY_TOOLS
         assert "evaluate_script" in CHROME_DANGEROUS_TOOLS
-        assert "new_page" in CHROME_DANGEROUS_TOOLS
+        # new_page 属于修改型工具，不属于危险工具
+        assert "new_page" in CHROME_MODIFY_TOOLS
 
     def test_no_overlap_between_categories(self):
         from permissions.modes import CHROME_SAFE_TOOLS, CHROME_MODIFY_TOOLS, CHROME_DANGEROUS_TOOLS

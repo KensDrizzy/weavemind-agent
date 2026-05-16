@@ -82,14 +82,18 @@ class MCPConnection:
 
     async def _connect_stdio(self) -> bool:
         """建立 stdio 传输连接（本地子进程）。"""
+        import subprocess
+
         params = StdioServerParameters(
             command=self.config["command"],
             args=self.config.get("args", []),
             env=self._merge_env(),
         )
 
+        # 将 MCP 子进程 stderr 重定向到 DEVNULL，避免启动信息直接打印到终端
+        # 注意：不能用 io.StringIO()，因为 subprocess 需要真实的文件描述符（fileno）
         read, write = await self._exit_stack.enter_async_context(
-            stdio_client(params)
+            stdio_client(params, errlog=subprocess.DEVNULL)
         )
         self._session = await self._exit_stack.enter_async_context(
             ClientSession(read, write)

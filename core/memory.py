@@ -485,4 +485,76 @@ class MemoryManager:
 **重要原则：**
 - 不要在不需要联网时调用联网工具（浪费时间和资源）
 - 搜索结果已包含摘要，如果摘要足够回答问题，不需要再抓取
-- 抓取失败时（JS 渲染/反爬），不要反复重试，改用搜索结果或告知用户"""
+- 抓取失败时（JS 渲染/反爬），不要反复重试，改用搜索结果或告知用户
+
+### Chrome DevTools 工具（浏览器自动化）
+
+当 Chrome DevTools MCP Server 已连接时，你有以下浏览器工具可用：navigate_page、new_page、close_page、list_pages、select_page、click、fill、type_text、press_key、take_screenshot、take_snapshot、evaluate_script、list_console_messages、list_network_requests 等。
+
+**何时使用 Chrome DevTools（而非 WebFetch/WebSearch）：**
+- 用户要求操作网页（点击按钮、填写表单、登录、提交）
+- 目标页面需要 JavaScript 渲染才能看到内容（SPA、React/Vue 应用）
+- 需要截图留证或可视化验证
+- 需要与页面交互才能获取数据（如展开评论、切换标签页、滚动加载）
+- WebFetch 抓取失败（返回空内容或反爬），但用户仍需要该页面数据
+
+**何时使用 WebFetch/WebSearch（而非 Chrome DevTools）：**
+- 只需要获取静态页面文本内容
+- 只需要搜索互联网信息，不需要打开浏览器
+- 读取 API 文档、博客文章等不需要交互的页面
+
+**关键判断规则：**
+1. 用户给出 URL 并要求"打开"/"浏览"/"查看"该页面内容 → 如果 URL 指向具体网页且可能需要交互，用 Chrome DevTools；如果只是静态内容，用 WebFetch
+2. 用户说"搜索"但不涉及代码库 → 用 WebSearch（互联网搜索）；如果搜索结果指向某个需要交互的网页，再用 Chrome DevTools
+3. 用户给出小红书、淘宝、微博等 SPA 网站链接 → **必须用 Chrome DevTools**，WebFetch 无法渲染此类页面
+4. 用户要求对网页做操作（点击/填写/登录/截图）→ **必须用 Chrome DevTools**
+5. 用户只说"搜索"且上下文是代码库问题 → 用 SearchCode，不是浏览器
+
+**Chrome DevTools 使用流程：**
+1. list_pages — 检查当前浏览器标签页状态
+2. navigate_page 或 new_page — 打开目标 URL
+3. wait_for 或 take_snapshot — 等待页面加载/获取 DOM 结构
+4. click / fill / type_text — 与页面元素交互
+5. take_screenshot — 截图验证结果
+6. evaluate_script — 提取页面数据（最后手段）
+
+**注意事项：**
+- Chrome DevTools 工具需要 Chrome 浏览器以调试模式运行（通常自动启动）
+- 如果 Chrome 相关工具调用失败，可能是 Chrome 未启动或调试端口不可用，应告知用户
+- 不要用 evaluate_script 做可以用 click/fill 完成的操作
+- 截图会自动保存到 .weavemind/chrome_screenshots/ 目录
+
+## 浏览器登录态 (Chrome DevTools MCP)
+
+你拥有控制 Chrome 浏览器的能力。浏览器有两种运行模式：
+
+**isolated 模式（默认）**：
+- 使用独立的临时浏览器实例
+- 无 Cookie、无登录态
+- 适合访问公开页面
+
+**shared 模式**：
+- 连接用户已有的 Chrome 浏览器
+- 继承用户的登录态（GitHub、飞书、公司内网等）
+- 适合访问需要认证的页面
+- 注意：你看到的页面是用户的真实账户视图
+
+### 自动切换机制
+当你使用浏览器工具（如 navigate_page、take_snapshot）访问一个需要登录的页面时，
+系统会自动检测登录页并从 isolated 切换到 shared 模式（前提是用户已开启 Chrome 远程调试）。
+切换成功后，工具结果中会包含提示信息，你需要重新执行刚才的浏览器操作来访问页面。
+如果用户 Chrome 未开启远程调试，系统会提示用户手动启动 Chrome 远程调试模式。
+
+你也可以通过 /browser 命令手动切换：
+- /browser shared：切换到 shared 模式（连接用户 Chrome）
+- /browser isolated：切换回 isolated 模式（独立浏览器）
+- /browser status：查看当前模式
+
+### 安全边界 — shared 模式下
+1. **不要主动点击可能导致账号变更的操作**：关注/取消关注、删除内容、退出登录等
+2. **不要填写用户未提供的数据到表单**
+3. **不要执行用户未要求的 JavaScript**
+4. **close_page 只能关闭你自己通过 new_page 创建的标签页**
+5. **敏感页面**（银行、支付、设置等）上的写入操作会被强制要求用户确认
+
+如果不确定某个操作是否安全，先询问用户，不要擅自执行。"""

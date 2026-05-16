@@ -35,6 +35,12 @@ class MCPManager:
         self._initialized = False
         self._init_lock = asyncio.Lock()
         self._chrome_launcher = None
+        self._tool_registry = None  # 由 app.py 在初始化后设置
+
+        # CDP 双模式支持
+        self._session_manager = None
+        self._browser_guard = None
+        self._init_cdp_components()
 
     async def initialize(self) -> bool:
         """
@@ -88,7 +94,7 @@ class MCPManager:
 
                         for tool_info in conn.get_tools_info():
                             try:
-                                tool_instance = create_mcp_tool_instance(tool_info, conn)
+                                tool_instance = create_mcp_tool_instance(tool_info, conn, mcp_manager=self)
                                 self._tools.append(tool_instance)
                                 logger.debug("注册 MCP 工具: %s", tool_info.name)
                             except Exception as e:
@@ -108,6 +114,13 @@ class MCPManager:
                     len(self._servers_config),
                     len(self._tools),
                 )
+
+                # 初始化 ChromeSessionManager（需要 MCP 连接已建立）
+                if "chrome" in self._connections:
+                    self._create_session_manager()
+                    # 启动 isolated 模式会话
+                    if self._session_manager:
+                        await self._session_manager.start_isolated()
             else:
                 logger.warning("没有可用的 MCP Server")
 
@@ -198,3 +211,109 @@ class MCPManager:
             except Exception:
                 results[name] = False
         return results
+
+    # ── CDP 双模式支持 ────────────────────────────────────────
+
+    def _init_cdp_components(self):
+        """初始化 CDP 双模式组件（BrowserGuard + ChromeSessionManager）。"""
+        import settings
+
+        # BrowserGuard：敏感页面保护
+        guard_enabled = settings.get("browser_guard.enabled", True)
+        if guard_enabled:
+            custom_patterns_file = settings.get(
+                "browser_guard.custom_patterns_file",
+                ".weavemind/sensitive_patterns.txt",
+            )
+            from mcp_client.browser_guard import BrowserGuard
+            self._browser_guard = BrowserGuard(custom_patterns_file=custom_patterns_file)
+            logger.info("BrowserGuard 已初始化（敏感页面保护）")
+
+        # ChromeSessionManager：在 initialize() 完成后创建（需要 MCP 连接）
+
+    def get_browser_guard(self):
+        """获取 BrowserGuard 实例。"""
+        return self._browser_guard
+
+    def get_session_manager(self):
+        """获取 ChromeSessionManager 实例。"""
+        return self._session_manager
+
+    def _create_session_manager(self):
+        """创建 ChromeSessionManager（在 MCP 初始化完成后调用）。"""
+        if self._session_manager:
+            return
+
+        from mcp_client.session_manager import ChromeSessionManager
+        self._session_manager = ChromeSessionManager(
+            mcp_manager=self,
+            chrome_launcher=self._chrome_launcher,
+        )
+        logger.info("ChromeSessionManager 已创建")
+
+    async def switch_to_shared(self) -> bool:
+        """切换到 shared 模式（连接用户 Chrome，继承登录态）。"""
+        if not self._session_manager:
+            self._create_session_manager()
+        return await self._session_manager.switch_to_shared()
+
+    async def switch_to_isolated(self) -> bool:
+        """切换回 isolated 模式（独立浏览器，无登录态）。"""
+        if not self._session_manager:
+            self._create_session_manager()
+        return await self._session_manager.switch_to_isolated()
+
+    def get_chrome_mode(self) -> Optional[str]:
+        """获取当前 Chrome 运行模式。"""
+        if self._session_manager:
+            mode = self._session_manager.current_mode
+            return mode.value if mode else None
+        return "isolated"  # 默认
+
+    def is_shared_mode(self) -> bool:
+        """是否处于 shared 模式。"""
+        return bool(self._session_manager and self._session_manager.is_shared)
+
+    def check_browser_tool(
+        self,
+        tool_name: str,
+        url: str = "",
+        page_id: str = "",
+    ) -> tuple:
+        """
+        检查浏览器工具调用是否被允许。
+
+        Args:
+            tool_name: 工具名称
+            url: 当前页面 URL
+            page_id: 标签页 ID
+
+        Returns:
+            (是否允许, 阻止原因)
+        """
+        if not self._browser_guard:
+            return True, None
+
+        is_agent_page = (
+            self._session_manager and
+            self._session_manager.is_agent_page(page_id)
+        )
+
+        return self._browser_guard.check_tool_use(tool_name, url, is_agent_page)
+
+    def needs_browser_confirmation(self, tool_name: str, url: str) -> tuple:
+        """检查浏览器工具是否需要用户确认。"""
+        if not self._browser_guard:
+            return False, None
+        return self._browser_guard.needs_confirmation(tool_name, url)
+
+    def record_agent_page(self, page_id: str):
+        """记录 Agent 创建的标签页。"""
+        if self._session_manager:
+            self._session_manager.record_agent_page(page_id)
+
+    def detect_need_login(self, page_content: str, url: str = "") -> bool:
+        """检测页面是否需要登录。"""
+        if not self._session_manager:
+            return False
+        return self._session_manager.detect_need_login(page_content, url)

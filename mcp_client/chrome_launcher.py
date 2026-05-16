@@ -98,7 +98,7 @@ class ChromeLauncher:
         return False
 
     # ── 启动 Chrome ─────────────────────────────────────────────
-
+    
     def start(self) -> bool:
         """启动 Chrome with remote debugging。
 
