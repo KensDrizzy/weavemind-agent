@@ -166,6 +166,9 @@ class WeaveMindCLI:
             # 创建持久事件循环（在后台线程中运行，不会提前关闭）
             self._mcp_loop = asyncio.new_event_loop()
 
+            # 注入持久事件循环到 MCPManager，供 browser_connect 等工具使用
+            self.mcp_manager.set_mcp_loop(self._mcp_loop)
+
             import threading
             self._mcp_thread = threading.Thread(
                 target=self._mcp_loop.run_forever,
@@ -248,7 +251,7 @@ class WeaveMindCLI:
 │  [cyan]██ ███ ██ ██      ██   ██  ██  ██  ██      ██  ██  ██ ██ ██  ██ ██ ██   ██[/cyan]   │
 │  [cyan] ███ ███  ███████ ██   ██   ████   ███████ ██      ██ ██ ██   ████ ██████ [/cyan]   │
 │                                                                               │
-│                                [dim]AGENT CLI[/dim]                                          │
+│                                [dim]AGENT CLI[/dim]                                      │
 │                                                                               │
 ╰───────────────────────────────────────────────────────────────────────────────╯
 """

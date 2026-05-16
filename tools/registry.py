@@ -1,4 +1,4 @@
-"""工具注册表 — 管理所有可用工具，包括内置工具和 MCP 工具。"""
+"""工具注册表 — 管理所有可用工具，包括内置工具、MCP 工具和浏览器控制工具。"""
 
 import logging
 
@@ -26,6 +26,7 @@ class ToolRegistry:
         self._mcp_manager = mcp_manager
         self._mcp_tools_registered = False
         self._register_builtins()
+        self._register_browser_tools()
         self._register_mcp_tools()
 
     def _register_builtins(self):
@@ -58,6 +59,21 @@ class ToolRegistry:
 
         for tool in tools_list:
             self._tools[tool.name] = tool
+
+    def _register_browser_tools(self):
+        """注册内置浏览器控制工具（browser_connect/disconnect/status）。
+
+        这些工具不是 MCP Server 提供的，而是 WeaveMind 内置工具，
+        用于控制 Chrome DevTools MCP Server 的模式切换。
+        """
+        if not self._mcp_manager:
+            return
+
+        from mcp_client.browser_tools import create_all_browser_tools
+        browser_tools = create_all_browser_tools(self._mcp_manager)
+        for tool in browser_tools:
+            self._tools[tool.name] = tool
+        logger.info("浏览器控制工具已注册: browser_connect, browser_disconnect, browser_status")
 
     def _register_mcp_tools(self):
         """注册 MCP 工具（从 MCPManager 获取已连接 Server 的工具）。"""

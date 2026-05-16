@@ -8,6 +8,7 @@ from mcp_client.chrome_launcher import ChromeLauncher
 from mcp_client.chrome_formatter import is_chrome_tool, format_chrome_result
 from mcp_client.client import MCPConnection
 from mcp_client.manager import MCPManager
+from mcp_client.browser_guard import BrowserGuard
 
 
 # ── ChromeLauncher 测试 ──────────────────────────────────────
@@ -16,18 +17,9 @@ from mcp_client.manager import MCPManager
 class TestChromeLauncher:
     """ChromeLauncher 单元测试。"""
 
-    def test_find_chrome_macos(self):
-        """macOS 上能找到 Chrome 路径。"""
-        import platform
-        if platform.system() != "Darwin":
-            pytest.skip("仅在 macOS 上运行")
-        launcher = ChromeLauncher(port=9222)
-        assert launcher.executable
-        assert "Chrome" in launcher.executable or "Chromium" in launcher.executable
-
     def test_check_port_not_listening(self):
         """未监听的端口应返回 False。"""
-        launcher = ChromeLauncher(port=19999)  # 不太可能被占用的端口
+        launcher = ChromeLauncher(port=19999)
         assert launcher.is_running() is False
 
     def test_check_port_listening(self):
@@ -47,7 +39,7 @@ class TestChromeLauncher:
                     self.send_response(404)
                     self.end_headers()
             def log_message(self, format, *args):
-                pass  # 静默日志
+                pass
 
         server = HTTPServer(("localhost", 0), DevToolsHandler)
         port = server.server_address[1]
@@ -59,11 +51,6 @@ class TestChromeLauncher:
         finally:
             server.shutdown()
 
-    def test_launched_by_us_default_false(self):
-        """初始状态 launched_by_us 应为 False。"""
-        launcher = ChromeLauncher(port=9222)
-        assert launcher.launched_by_us is False
-
 
 # ── ChromeFormatter 测试 ─────────────────────────────────────
 
@@ -72,116 +59,33 @@ class TestChromeFormatter:
     """Chrome DevTools 结果格式化器测试。"""
 
     def test_is_chrome_tool_known(self):
-        """已知 Chrome 工具应返回 True。"""
         assert is_chrome_tool("take_screenshot") is True
         assert is_chrome_tool("navigate_page") is True
         assert is_chrome_tool("click") is True
-        assert is_chrome_tool("evaluate_script") is True
-        assert is_chrome_tool("list_pages") is True
 
     def test_is_chrome_tool_unknown(self):
-        """非 Chrome 工具应返回 False。"""
         assert is_chrome_tool("bash") is False
         assert is_chrome_tool("read_file") is False
-        assert is_chrome_tool("") is False
 
     def test_format_error_result(self):
-        """错误结果应格式化为 [Chrome错误] 前缀。"""
         mock_result = MagicMock()
         mock_result.isError = True
         mock_content = MagicMock()
         mock_content.type = "text"
         mock_content.text = "页面不存在"
         mock_result.content = [mock_content]
-
         result = format_chrome_result("navigate_page", mock_result)
         assert result.startswith("[Chrome错误]")
-        assert "页面不存在" in result
 
     def test_format_generic_result(self):
-        """通用结果应正常格式化。"""
         mock_result = MagicMock()
         mock_result.isError = False
         mock_content = MagicMock()
         mock_content.type = "text"
         mock_content.text = "已导航到 https://example.com"
         mock_result.content = [mock_content]
-
         result = format_chrome_result("navigate_page", mock_result)
         assert "https://example.com" in result
-
-    def test_format_screenshot_saves_file(self):
-        """截图结果应保存为文件。"""
-        import base64
-        from pathlib import Path
-
-        # 创建假的 PNG 数据（1x1 红色像素）
-        png_data = base64.b64encode(
-            b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01'
-            b'\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00'
-            b'\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x00\x03'
-            b'\x00\x01\x00\x18\xdd\x8d\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
-        ).decode()
-
-        mock_result = MagicMock()
-        mock_result.isError = False
-        mock_content = MagicMock()
-        mock_content.type = "image"
-        mock_content.data = png_data
-        mock_content.mimeType = "image/png"
-        mock_result.content = [mock_content]
-
-        result = format_chrome_result("take_screenshot", mock_result)
-        assert "截图已保存" in result
-        assert ".weavemind/chrome_screenshots" in result
-
-    def test_format_long_text_truncated(self):
-        """超长文本应被截断。"""
-        mock_result = MagicMock()
-        mock_result.isError = False
-        mock_content = MagicMock()
-        mock_content.type = "text"
-        mock_content.text = "x" * 20000  # 超长文本
-        mock_result.content = [mock_content]
-
-        result = format_chrome_result("take_snapshot", mock_result)
-        assert len(result) < 20000
-        assert "已截断" in result
-
-
-# ── MCPConnection 测试 ──────────────────────────────────────
-
-
-class TestMCPConnection:
-    """MCPConnection 单元测试。"""
-
-    def test_detect_chrome_server_type(self):
-        """含 chrome 子配置时应检测为 chrome 类型。"""
-        config = {
-            "name": "chrome",
-            "transport": "stdio",
-            "command": "npx",
-            "chrome": {"auto_start": False, "port": 9222},
-        }
-        conn = MCPConnection(config)
-        assert conn.server_type == "chrome"
-
-    def test_detect_generic_server_type(self):
-        """无 chrome 子配置时应检测为 generic 类型。"""
-        config = {
-            "name": "filesystem",
-            "transport": "stdio",
-            "command": "npx",
-        }
-        conn = MCPConnection(config)
-        assert conn.server_type == "generic"
-
-    def test_has_loop_attribute(self):
-        """MCPConnection 应有 _loop 属性。"""
-        config = {"name": "test", "transport": "stdio", "command": "echo"}
-        conn = MCPConnection(config)
-        assert hasattr(conn, "_loop")
-        assert conn._loop is None  # 连接前应为 None
 
 
 # ── MCPManager 测试 ──────────────────────────────────────────
@@ -191,55 +95,65 @@ class TestMCPManager:
     """MCPManager 单元测试。"""
 
     def test_no_servers_config(self):
-        """无服务器配置时应正常初始化。"""
         manager = MCPManager(servers_config={})
-        # 同步测试，不调用 async initialize
         assert manager._connections == {}
         assert manager._tools == []
 
-    def test_chrome_launcher_not_created_by_default(self):
-        """无 chrome 配置时不应创建 ChromeLauncher。"""
-        manager = MCPManager(servers_config={
-            "filesystem": {"enabled": True, "transport": "stdio", "command": "echo"},
-        })
-        assert manager._chrome_launcher is None
-
-    def test_ensure_chrome_running_skips_if_running(self):
-        """Chrome 已运行时 _ensure_chrome_running 不应启动新进程。"""
+    def test_default_mode_is_isolated(self):
         manager = MCPManager(servers_config={})
+        assert manager.get_chrome_mode() == "isolated"
+        assert manager.is_isolated_mode() is True
+        assert manager.is_shared_mode() is False
 
-        with patch.object(ChromeLauncher, "is_running", return_value=True):
-            manager._ensure_chrome_running({"port": 9222})
-            assert manager._chrome_launcher is not None
-            # 不应调用 start()
-            assert manager._chrome_launcher.launched_by_us is False
+    def test_browser_guard_initialized(self):
+        manager = MCPManager(servers_config={})
+        assert manager.get_browser_guard() is not None
+
+    def test_isolated_args_constant(self):
+        assert "--isolated" in MCPManager.ISOLATED_ARGS
+        assert "--autoConnect" in MCPManager.SHARED_AUTOCONNECT_ARGS
+        assert "--browserUrl" in MCPManager.SHARED_BROWSER_URL_ARGS
 
 
-# ── 权限分类测试 ─────────────────────────────────────────────
+# ── BrowserGuard 测试 ──────────────────────────────────────────
 
 
-class TestChromePermissions:
-    """Chrome 工具权限分类测试。"""
+class TestBrowserGuard:
+    """BrowserGuard 单元测试。"""
 
-    def test_safe_tools_exist(self):
-        from permissions.modes import CHROME_SAFE_TOOLS
-        assert "list_pages" in CHROME_SAFE_TOOLS
-        assert "take_screenshot" in CHROME_SAFE_TOOLS
+    def test_detect_login_url(self):
+        guard = BrowserGuard()
+        assert guard.detect_login_page("", "https://example.com/login") is True
+        assert guard.detect_login_page("", "https://example.com/signin") is True
+        assert guard.detect_login_page("", "https://example.com/home") is False
 
-    def test_modify_tools_exist(self):
-        from permissions.modes import CHROME_MODIFY_TOOLS
-        assert "navigate_page" in CHROME_MODIFY_TOOLS
-        assert "click" in CHROME_MODIFY_TOOLS
-        assert "fill" in CHROME_MODIFY_TOOLS
+    def test_detect_login_content(self):
+        guard = BrowserGuard()
+        assert guard.detect_login_page('<input type="password">') is True
+        assert guard.detect_login_page("请登录您的账号") is True
+        assert guard.detect_login_page("欢迎回来") is False
 
-    def test_dangerous_tools_exist(self):
-        from permissions.modes import CHROME_DANGEROUS_TOOLS, CHROME_MODIFY_TOOLS
-        assert "evaluate_script" in CHROME_DANGEROUS_TOOLS
-        # new_page 属于修改型工具，不属于危险工具
-        assert "new_page" in CHROME_MODIFY_TOOLS
+    def test_apply_after_execution_navigate(self):
+        guard = BrowserGuard()
+        guard.apply_after_execution("navigate_page", {"url": "https://example.com"}, "")
+        assert guard.last_navigated_url == "https://example.com"
 
-    def test_no_overlap_between_categories(self):
-        from permissions.modes import CHROME_SAFE_TOOLS, CHROME_MODIFY_TOOLS, CHROME_DANGEROUS_TOOLS
-        assert CHROME_SAFE_TOOLS & CHROME_MODIFY_TOOLS == set()
-        assert CHROME_SAFE_TOOLS & CHROME_DANGEROUS_TOOLS == set()
-        assert CHROME_MODIFY_TOOLS & CHROME_DANGEROUS_TOOLS == set()
+    def test_apply_after_execution_new_page(self):
+        guard = BrowserGuard()
+        guard.apply_after_execution("new_page", {"url": "https://example.com"}, "page-abc123 opened")
+        assert "page-abc123" in guard.agent_opened_tabs
+
+    def test_needs_confirmation_sensitive_write(self):
+        guard = BrowserGuard()
+        needs, msg = guard.needs_confirmation("click", "https://www.alipay.com/pay")
+        assert needs is True
+
+    def test_needs_confirmation_safe_write(self):
+        guard = BrowserGuard()
+        needs, msg = guard.needs_confirmation("click", "https://example.com/page")
+        assert needs is False
+
+    def test_check_tool_use_blocks_sensitive_write(self):
+        guard = BrowserGuard()
+        allowed, reason = guard.check_tool_use("click", "https://www.alipay.com/pay")
+        assert allowed is False

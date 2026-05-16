@@ -86,7 +86,6 @@ class AgentLoop:
         self._tool_unavailable_reasons: dict[str, str] = {}
         self._tool_failure_counts: dict[str, int] = {}
         self._disabled_tools: dict[str, str] = {}
-        self._auto_switched_to_shared = False  # 本轮是否已自动切换到 shared
 
         self.llm = create_llm(provider, model)
         self.tools = self._filter_available_tools(tool_registry.get_langchain_tools())
@@ -198,7 +197,6 @@ class AgentLoop:
         self._model_call_count = 0
         self._tool_failure_counts = {}
         self._disabled_tools = {}
-        self._auto_switched_to_shared = False
 
     def _record_tool_failure(self, tool_name: str, error: str):
         """记录工具失败次数，超过阈值后本轮禁用。"""
@@ -209,6 +207,63 @@ class AgentLoop:
                 f"工具 {tool_name} 已连续失败 {failed} 次，本轮将不再执行。"
                 "请不要继续调用该工具，直接向用户说明原因并给出替代方案。"
             )
+
+    # 纯重复性工具（滚动+截图循环的标志）
+    _BROWSER_REPEAT_TOOLS = frozenset({
+        "take_screenshot", "take_snapshot",
+    })
+    _BROWSER_LOOP_WINDOW = 16  # 检查窗口大小
+
+    def _detect_browser_loop(self, messages: list) -> bool:
+        """检测浏览器工具是否陷入重复循环。
+
+        策略：
+        1. 检查最近 16 条工具调用中 screenshot/snapshot 是否 ≥5 次（纯重复截图）
+        2. 检查是否出现相同的 3-tool 序列重复 ≥3 次（模式重复）
+        触发后注入停止指令。
+        """
+        # 从 AIMessage.tool_calls 提取工具名（比 ToolMessage.name 更可靠）
+        recent_tool_names = []
+        for m in reversed(messages):
+            if isinstance(m, AIMessage) and m.tool_calls:
+                for tc in reversed(m.tool_calls):
+                    recent_tool_names.append(tc.get("name", ""))
+                    if len(recent_tool_names) >= self._BROWSER_LOOP_WINDOW:
+                        break
+            if len(recent_tool_names) >= self._BROWSER_LOOP_WINDOW:
+                break
+
+        # 过滤掉空名称
+        recent_tool_names = [n for n in recent_tool_names if n]
+        if len(recent_tool_names) < 6:
+            return False
+
+        # 检测 1：截图/快照工具过多
+        repeat_count = sum(1 for t in recent_tool_names if t in self._BROWSER_REPEAT_TOOLS)
+        if repeat_count >= 5:
+            self._inject_stop_message(messages, "重复截图/快照过多")
+            return True
+
+        # 检测 2：3-gram 模式重复
+        recent_tool_names.reverse()  # 恢复时间顺序
+        trigrams = [tuple(recent_tool_names[i:i+3]) for i in range(len(recent_tool_names) - 2)]
+        if trigrams:
+            from collections import Counter
+            most_common = Counter(trigrams).most_common(1)[0]
+            if most_common[1] >= 3:
+                self._inject_stop_message(messages, f"工具序列 {most_common[0]} 重复 {most_common[1]} 次")
+                return True
+
+        return False
+
+    def _inject_stop_message(self, messages: list, reason: str):
+        """注入停止指令。"""
+        logger.warning("检测到浏览器循环（%s），注入停止指令", reason)
+        messages.append(SystemMessage(content=(
+            "[系统中断] 你已经陷入重复的浏览器操作循环。\n"
+            "请立即停止，根据已获取的内容进行总结回复用户。\n"
+            "不要再调用 take_screenshot 或 take_snapshot。"
+        )))
 
     def _build_graph(self) -> StateGraph:
         """构建 LangGraph 状态图。"""
@@ -268,6 +323,49 @@ class AgentLoop:
         if self.compactor.should_compact(messages):
             messages = self.compactor.compact(messages)
 
+        # 注入浏览器模式指令（强制 LLM 按工作流处理登录态问题）
+        if self.mcp_manager and self.mcp_manager._chrome_server_name:
+            mode = self.mcp_manager.get_chrome_mode()
+            browser_hint = {
+                "isolated": (
+                    "[浏览器操作指令] 当前为 isolated 模式（独立浏览器，无登录态）。\n"
+                    "操作规则（必须遵守）：\n"
+                    "1. 先用浏览器工具（new_page/navigate_page + take_snapshot）尝试访问页面\n"
+                    "2. 如果返回登录页/401/403/需要登录，立即执行以下步骤：\n"
+                    "   a) 关闭当前页面（close_page）\n"
+                    "   b) 调用 browser_connect 切换到 shared 模式\n"
+                    "   c) 切换成功后，重新用 new_page 或 navigate_page 打开同一 URL\n"
+                    "   d) 获取页面内容\n"
+                    "3. 如果 browser_connect 返回失败信息（提示 Chrome 未开启远程调试），\n"
+                    "   则停止尝试，向用户说明需要先在 Chrome 中开启远程调试。\n"
+                    "4. 不要反复询问用户，按上述步骤自动执行。"
+                ),
+                "shared": (
+                    "[浏览器操作指令] 当前为 shared 模式（连接用户 Chrome，有登录态）。\n"
+                    "可以直接访问需要登录的页面。如果仍遇到权限问题，可能是用户未在该网站登录。\n\n"
+                    "内容抓取策略（必须遵守）：\n"
+                    "1. 搜索结果页：用 evaluate_script 提取帖子标题和链接列表，不要只看快照\n"
+                    "2. 深入阅读：从搜索结果中选择 3-5 个最相关的帖子，逐个点击进入提取正文内容\n"
+                    "3. 质量判断：进入帖子后用 evaluate_script 提取正文文本，如果内容太短（<100字）\n"
+                    "   或与用户需求不相关，返回搜索结果页（navigate_page 回退）尝试下一个帖子\n"
+                    "4. 内容提取：优先用 evaluate_script 提取文本，而非 take_snapshot/take_screenshot\n"
+                    "5. 完成条件：成功提取 2-3 个有实质内容的帖子后，立即总结回复用户\n\n"
+                    "禁止行为：\n"
+                    "- 不要反复滚动加载更多搜索结果\n"
+                    "- 不要对同一页面重复截图/快照\n"
+                    "- 总共最多访问 5 个帖子详情页，之后必须根据已有内容总结"
+                ),
+            }.get(mode, "")
+            if browser_hint:
+                # 避免重复注入（检查最近 3 条消息中是否已有浏览器指令）
+                has_hint = any(
+                    "[浏览器操作指令]" in str(m.content)
+                    for m in messages[-3:]
+                    if hasattr(m, "content") and m.content
+                )
+                if not has_hint:
+                    messages.append(SystemMessage(content=browser_hint))
+
         self._model_call_count += 1
         call_index = self._model_call_count
         start_at = time.perf_counter()
@@ -283,19 +381,25 @@ class AgentLoop:
         full_chunk = None
         stream_failed = False
         emitted_any_delta = False
-        try:
-            for chunk in self.llm_with_tools.stream(messages):
-                full_chunk = chunk if full_chunk is None else full_chunk + chunk
-                delta_text = self._extract_text_content(getattr(chunk, "content", ""))
-                if delta_text and self.hook_manager:
-                    emitted_any_delta = True
-                    self.hook_manager.emit("LLMDelta", {
-                        "call_index": call_index,
-                        "delta": delta_text,
-                    })
-        except Exception as e:
-            stream_failed = True
-            logger.debug(f"LLM stream 失败，回退 invoke: {e}")
+
+        # MiMo 模型禁用了 streaming（_stream 为空生成器），直接走 invoke 避免无效尝试
+        from core.llm_factory import MiMoChatOpenAI
+        skip_stream = isinstance(self.llm, MiMoChatOpenAI)
+
+        if not skip_stream:
+            try:
+                for chunk in self.llm_with_tools.stream(messages):
+                    full_chunk = chunk if full_chunk is None else full_chunk + chunk
+                    delta_text = self._extract_text_content(getattr(chunk, "content", ""))
+                    if delta_text and self.hook_manager:
+                        emitted_any_delta = True
+                        self.hook_manager.emit("LLMDelta", {
+                            "call_index": call_index,
+                            "delta": delta_text,
+                        })
+            except Exception as e:
+                stream_failed = True
+                logger.debug(f"LLM stream 失败，回退 invoke: {e}")
 
         if full_chunk is None or stream_failed:
             response = self.llm_with_tools.invoke(messages)
@@ -443,6 +547,13 @@ class AgentLoop:
         # Plan 模式：首次进入时继续，计划执行后结束，避免循环
         if self.force_plan_mode:
             return "continue" if state.get("plan") is None else "end"
+        # 硬性迭代上限
+        if self._model_call_count >= MAX_ITERATIONS:
+            logger.warning("达到最大迭代次数 %d，强制结束", MAX_ITERATIONS)
+            return "end"
+        # 浏览器工具重复检测（防止无限滚动/截图循环）
+        if self._detect_browser_loop(state["messages"]):
+            return "end"
         # 普通模式：有 tool_calls 则继续
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
             return "continue"
@@ -697,159 +808,32 @@ class AgentLoop:
                     "result": str(result)[:500],
                 })
 
-            # ── 自动检测登录页并切换到 shared 模式 ──────────────────
-            if not had_error and self.mcp_manager and not self._auto_switched_to_shared:
-                result_str = str(result)
-                switched, switch_msg = self._try_auto_switch_on_login(
-                    tool_name, result_str, tool_args
-                )
-                if switched:
-                    # 切换成功，在结果中追加提示让 Agent 重试
-                    result = f"{result_str}\n\n{switch_msg}"
+            # browser_connect/browser_disconnect 执行后刷新工具列表
+            if not had_error and tool_name in ("browser_connect", "browser_disconnect") and self.mcp_manager:
+                self._refresh_tools_after_browser_switch()
 
             from langchain_core.messages import ToolMessage
             tool_messages.append(ToolMessage(
                 content=str(result),
                 tool_call_id=tool_call["id"],
+                name=tool_name,
             ))
 
         return {"messages": tool_messages}
 
-    def _try_auto_switch_on_login(
-        self, tool_name: str, result_str: str, tool_args: dict
-    ) -> tuple[bool, str]:
-        """检测 Chrome 工具结果是否包含登录页，自动切换到 shared 模式。
+    def _refresh_tools_after_browser_switch(self):
+        """browser_connect/browser_disconnect 执行后刷新 AgentLoop 的工具列表。
 
-        触发条件：
-        1. 工具是 Chrome DevTools MCP 工具
-        2. 当前处于 isolated 模式
-        3. 结果中检测到登录页特征（URL 或页面内容）
-        4. 本轮尚未自动切换过
-        5. 配置允许自动切换（chrome_mode.auto_switch.on_login_detected=true）
-
-        Returns:
-            (是否已切换, 提示信息)
-        """
-        from mcp_client.chrome_formatter import is_chrome_tool
-
-        # 只检测 Chrome 工具
-        if not is_chrome_tool(tool_name):
-            return False, ""
-
-        # 当前必须是 isolated 模式才有切换的必要
-        if not self.mcp_manager or self.mcp_manager.is_shared_mode():
-            return False, ""
-
-        # 本轮已切换过，不再重复
-        if self._auto_switched_to_shared:
-            return False, ""
-
-        # 检查配置是否允许自动切换
-        import settings
-        auto_switch_enabled = settings.get("chrome_mode.auto_switch.on_login_detected", True)
-        if not auto_switch_enabled:
-            return False, ""
-
-        # 从工具参数中提取 URL
-        url = tool_args.get("url", "") or tool_args.get("page_url", "")
-
-        # 检测登录页
-        need_login = self.mcp_manager.detect_need_login(result_str, url)
-
-        if not need_login:
-            return False, ""
-
-        logger.info("检测到登录页 (tool=%s, url=%s)，尝试自动切换到 shared 模式",
-                     tool_name, url)
-
-        # 先检查用户 Chrome 是否可用
-        from mcp_client.auto_connect import AutoConnectDiscovery
-        discovery = AutoConnectDiscovery()
-        if not discovery.is_remote_debugging_enabled():
-            # 用户 Chrome 未开启远程调试，提示用户
-            msg = (
-                "[浏览器登录态检测] 当前页面需要登录，但 isolated 模式无登录态。"
-                "如需自动使用你的 Chrome 登录态，请先用远程调试模式启动 Chrome：\n"
-                "  macOS: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222\n"
-                "  然后使用 /browser shared 切换模式。"
-            )
-            logger.info("用户 Chrome 未开启远程调试，无法自动切换")
-            return False, ""
-
-        # 自动切换到 shared 模式
-        success = self._auto_switch_to_shared()
-
-        if success:
-            msg = (
-                "[浏览器自动切换] 检测到登录页，已自动切换到 shared 模式"
-                "（连接你的 Chrome，继承登录态）。"
-                "请重新执行刚才的浏览器操作（如 navigate_page），"
-                "现在应该可以访问需要登录的页面了。"
-            )
-            return True, msg
-        else:
-            msg = (
-                "[浏览器切换失败] 检测到登录页，尝试切换到 shared 模式失败。"
-                "你可以手动使用 /browser shared 切换。"
-            )
-            return False, msg
-
-    def _auto_switch_to_shared(self) -> bool:
-        """同步执行自动切换到 shared 模式。
-
-        使用 MCPManager 的持久事件循环执行 async 切换，
-        切换后刷新 AgentLoop 的工具列表。
-
-        Returns:
-            是否切换成功
-        """
-        import asyncio
-
-        try:
-            # 使用 MCPManager 的持久事件循环
-            loop = None
-            conn = self.mcp_manager.get_connection("chrome")
-            if conn and conn._loop and conn._loop.is_running():
-                loop = conn._loop
-
-            if loop:
-                future = asyncio.run_coroutine_threadsafe(
-                    self.mcp_manager.switch_to_shared(), loop
-                )
-                success = future.result(timeout=30)
-            else:
-                # 降级：直接 asyncio.run
-                success = asyncio.run(self.mcp_manager.switch_to_shared())
-
-            if success:
-                self._auto_switched_to_shared = True
-                # 刷新工具列表（MCP Server 重启后工具可能变化）
-                self._refresh_tools_after_switch()
-                logger.info("已自动切换到 shared 模式并刷新工具列表")
-                return True
-            else:
-                logger.warning("自动切换到 shared 模式失败")
-                return False
-
-        except Exception as e:
-            logger.error("自动切换到 shared 模式异常: %s", e)
-            return False
-
-    def _refresh_tools_after_switch(self):
-        """切换模式后刷新 AgentLoop 的工具列表。
-
-        _re_register_tools 已同步更新 MCPManager._tools 和 ToolRegistry._tools，
-        此方法只需重建 llm_with_tools 即可。
+        MCPManager 重启 MCP Server 后，ToolRegistry 中的 Chrome 工具已更新，
+        此方法重建 LLM 绑定的工具列表，使下一轮 think 能使用新工具。
         """
         try:
-            # 重建 LLM 绑定的工具
             self.tools = self._filter_available_tools(
                 self.tool_registry.get_langchain_tools()
             )
             self.llm_with_tools = self.llm.bind_tools(self.tools)
-
-            logger.info("工具列表已刷新，当前 %d 个工具可用", len(self.tools))
-
+            self._tool_map = {t.name: t for t in self.tools}
+            logger.info("浏览器模式切换后工具列表已刷新，当前 %d 个工具可用", len(self.tools))
         except Exception as e:
             logger.error("刷新工具列表失败: %s", e)
 

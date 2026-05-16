@@ -18,6 +18,7 @@ class TerminalHitlHandler:
     def __init__(self):
         self.enabled = False
         self._approved_all_tools: set[str] = set()
+        self._approved_all_global: bool = False  # 全局放行标志
 
     def is_enabled(self) -> bool:
         return self.enabled
@@ -28,7 +29,11 @@ class TerminalHitlHandler:
     def request_approval(self, request: ApprovalRequest) -> ApprovalResult:
         """请求用户审批，返回审批结果。"""
 
-        # 检查是否已全部放行
+        # 检查全局放行
+        if self._approved_all_global:
+            return ApprovalResult(decision=ApprovalDecision.APPROVED_ALL)
+
+        # 检查是否已全部放行（单工具）
         if request.tool_name in self._approved_all_tools:
             logger.info("[HITL] %s 已在本次会话中全部放行，自动通过", request.tool_name)
             console.print(f"  [dim][HITL] {request.tool_name} 已全部放行，自动通过[/dim]")
@@ -52,7 +57,7 @@ class TerminalHitlHandler:
                 return ApprovalResult(decision=ApprovalDecision.APPROVED)
 
             if user_input == "a":
-                self._approved_all_tools.add(request.tool_name)
+                self._approved_all_global = True
                 return ApprovalResult(decision=ApprovalDecision.APPROVED_ALL)
 
             if user_input == "n":
@@ -93,7 +98,10 @@ class TerminalHitlHandler:
     def clear_approved_all(self):
         """清除本次会话中积累的全部放行记录。"""
         self._approved_all_tools.clear()
+        self._approved_all_global = False
 
     def approved_all_count(self) -> int:
         """返回已全部放行的工具数量。"""
+        if self._approved_all_global:
+            return -1  # -1 表示全局放行
         return len(self._approved_all_tools)

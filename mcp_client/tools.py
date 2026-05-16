@@ -4,10 +4,6 @@
   MCP Server 通过 tools/list 返回工具元数据（含 inputSchema），
   本模块根据元数据动态生成 WeaveMindTool 子类，使其能像内置工具一样
   被 ToolRegistry 注册、被 AgentLoop 调用。
-
-实现策略：
-  使用 class 语句 + 预定义闭包函数的方式创建工具类，
-  避免 Pydantic V2 的字段覆盖问题和抽象方法实例化问题。
 """
 
 import asyncio
@@ -105,6 +101,29 @@ def _format_description(tool_info: MCPToolInfo) -> str:
 
 # ── 工具结果格式化 ─────────────────────────────────────────────────
 
+# 登录/权限问题检测关键词（用于提示 LLM 调用 browser_connect）
+_LOGIN_DETECTION_PATTERNS = [
+    "login", "sign in", "signin", "log in", "login", "登錄", "登录", "登陆",
+    "401", "403", "unauthorized", "未授权", "无权限", "禁止访问",
+    "need login", "需要登录", "请先登录", "authentication required",
+    "access denied", "拒绝访问",
+]
+
+
+def _detect_login_hint(result_str: str) -> str:
+    """检测结果中是否包含登录/权限问题，返回提示信息。"""
+    import re
+    result_lower = result_str.lower()
+    for pattern in _LOGIN_DETECTION_PATTERNS:
+        if pattern.lower() in result_lower:
+            return (
+                "\n\n[系统提示：检测到可能需要登录的页面。"
+                "如果当前是 isolated 模式，请调用 browser_connect 切换到 shared 模式，"
+                "然后立即用相同参数重试刚才的操作。]"
+            )
+    return ""
+
+
 def _format_result(result: Any) -> str:
     """将 MCP 工具返回结果格式化为字符串。"""
     is_error = getattr(result, "isError", False)
@@ -116,7 +135,9 @@ def _format_result(result: Any) -> str:
             if getattr(item, "type", None) == "text":
                 error_texts.append(getattr(item, "text", ""))
         error_msg = "\n".join(error_texts) if error_texts else "未知错误"
-        return f"[MCP错误] {error_msg}"
+        result_str = f"[MCP错误] {error_msg}"
+        # 错误结果也检测登录问题
+        return result_str + _detect_login_hint(result_str)
 
     texts = []
     for item in content:
@@ -131,111 +152,23 @@ def _format_result(result: Any) -> str:
             if resource:
                 texts.append(f"[资源: {getattr(resource, 'uri', 'unknown')}]")
 
-    return "\n".join(texts) if texts else "(工具执行完成，无返回内容)"
+    result_str = "\n".join(texts) if texts else "(工具执行完成，无返回内容)"
+    # 检测登录问题并追加提示
+    return result_str + _detect_login_hint(result_str)
 
 
 # ── 动态工具类工厂 ─────────────────────────────────────────────────
 
 
-def _try_auto_switch_to_shared(
-    result_str: str,
-    tool_args: dict,
-    tool_name: str,
-    mcp_manager,
-    format_fn,
-    conn=None,  # 当前 MCPConnection，用于获取事件循环
-) -> str:
-    """检测 Chrome 工具结果是否需要登录，自动切换到 shared 模式并重试。
-
-    如果结果表明需要登录且当前是 isolated 模式，会：
-    1. 通过 session_manager.switch_to_shared() 切换模式
-    2. 获取新的 MCP 连接
-    3. 重新执行工具调用
-
-    只重试一次，避免无限循环。
-    """
-    session_manager = mcp_manager.get_session_manager()
-    if not session_manager or session_manager.is_shared:
-        return result_str
-
-    # 检测是否需要登录
-    url = tool_args.get("url", "")
-    if not session_manager.detect_need_login(result_str, url):
-        return result_str
-
-    logger.info("Chrome 工具 '%s' 检测到需要登录，尝试自动切换到 shared 模式...", tool_name)
-
-    try:
-        # 使用连接的事件循环（与 sync_func 保持一致）
-        loop = getattr(conn, "_loop", None)
-        if loop and loop.is_running():
-            switched = asyncio.run_coroutine_threadsafe(
-                session_manager.switch_to_shared(), loop
-            ).result(timeout=30)
-        else:
-            # 没有持久事件循环时，创建新的
-            loop = asyncio.new_event_loop()
-            try:
-                switched = loop.run_until_complete(
-                    session_manager.switch_to_shared()
-                )
-            finally:
-                loop.close()
-
-        if not switched:
-            logger.warning("自动切换到 shared 模式失败，返回原始结果")
-            return result_str
-
-        # 获取新的连接并重试
-        new_conn = mcp_manager.get_connection("chrome")
-        if not new_conn:
-            logger.warning("切换后未找到新的 Chrome 连接")
-            return result_str
-
-        logger.info("已切换到 shared 模式，重新执行 %s...", tool_name)
-
-        new_loop = getattr(new_conn, "_loop", None)
-        if new_loop and new_loop.is_running():
-            retry_result = asyncio.run_coroutine_threadsafe(
-                new_conn.call_tool(tool_name, tool_args), new_loop
-            ).result(timeout=120)
-        else:
-            loop = asyncio.new_event_loop()
-            try:
-                retry_result = loop.run_until_complete(
-                    new_conn.call_tool(tool_name, tool_args)
-                )
-            finally:
-                loop.close()
-
-        retry_str = format_fn(retry_result)
-        return f"[已自动切换到 shared 模式（连接用户 Chrome）]\n{retry_str}"
-
-    except Exception as e:
-        logger.error("自动切换到 shared 模式出错: %s", e)
-        return result_str
-
-
 def create_mcp_tool_instance(
     tool_info: MCPToolInfo,
     connection,  # MCPConnection 实例
-    mcp_manager=None,  # MCPManager 实例（用于 Chrome 自动切换）
+    mcp_manager=None,  # MCPManager 实例（用于 Chrome 模式切换）
 ) -> WeaveMindTool:
-    """
-    根据 MCP 工具元数据创建 WeaveMindTool 实例。
+    """根据 MCP 工具元数据创建 WeaveMindTool 实例。
 
-    使用 StructuredTool.from_function 将 MCP 工具封装为 LangChain 工具，
-    这是 LangChain 推荐的动态工具创建方式，完全兼容 Pydantic V2。
-
-    当 connection.server_type == "chrome" 且工具属于 Chrome DevTools 时，
-    使用 Chrome 专用格式化器（截图保存文件、DOM 截断等）。
-
-    Args:
-        tool_info: MCP 工具元数据（来自 tools/list）
-        connection: MCPConnection 实例
-
-    Returns:
-        WeaveMindTool 实例，可直接注册到 ToolRegistry
+    sync_func 通过 run_coroutine_threadsafe 在持久 MCP 事件循环上执行，
+    避免 asyncio.run() 创建新循环破坏 MCP stdio 连接。
     """
     from langchain_core.tools import StructuredTool
     from mcp_client.chrome_formatter import is_chrome_tool, format_chrome_result
@@ -255,52 +188,37 @@ def create_mcp_tool_instance(
             return format_chrome_result(tname, result)
         return _format_result(result)
 
-    # 创建同步调用函数（闭包捕获 conn、tname、mcp_manager）
+    # 创建同步调用函数
     def sync_func(**kwargs) -> str:
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
-            # 优先使用 MCP 连接的事件循环（避免 asyncio.run 关闭循环导致 stdio 连接断开）
-            if conn._loop and conn._loop.is_running():
+            # 使用持久 MCP 事件循环（由 app.py 注入到 MCPManager）
+            loop = mcp_manager._mcp_loop if mcp_manager else None
+            if loop and loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    conn.call_tool(tname, filtered_kwargs), loop
+                )
+                result = future.result(timeout=120)
+            elif conn._loop and conn._loop.is_running():
+                # 降级：使用 MCPConnection 保存的事件循环
                 future = asyncio.run_coroutine_threadsafe(
                     conn.call_tool(tname, filtered_kwargs), conn._loop
                 )
                 result = future.result(timeout=120)
-                result_str = _format(result)
-
-                # Chrome 工具自动检测登录页 → 切换 shared 模式重试
-                if use_chrome_formatter and mcp_manager:
-                    result_str = _try_auto_switch_to_shared(
-                        result_str, filtered_kwargs, tname, mcp_manager, _format, conn=conn
-                    )
-                return result_str
-
-            # 降级：没有持久事件循环时使用 asyncio.run
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(
-                        asyncio.run, conn.call_tool(tname, filtered_kwargs)
-                    )
-                    result = future.result(timeout=120)
-                    result_str = _format(result)
-                    if use_chrome_formatter and mcp_manager:
-                        result_str = _try_auto_switch_to_shared(
-                            result_str, filtered_kwargs, tname, mcp_manager, _format, conn=conn
-                        )
-                    return result_str
             else:
+                # 无持久循环（测试等场景）
                 result = asyncio.run(conn.call_tool(tname, filtered_kwargs))
-                result_str = _format(result)
-                if use_chrome_formatter and mcp_manager:
-                    result_str = _try_auto_switch_to_shared(
-                        result_str, filtered_kwargs, tname, mcp_manager, _format, conn=conn
-                    )
-                return result_str
-        except RuntimeError:
-            result = asyncio.run(conn.call_tool(tname, filtered_kwargs))
-            return _format(result)
+
+            result_str = _format(result)
+
+            # 执行后更新 BrowserGuard 状态
+            if use_chrome_formatter and mcp_manager:
+                mcp_manager.apply_browser_after_execution(
+                    tname, filtered_kwargs, result_str
+                )
+            return result_str
         except Exception as e:
+            logger.error("MCP 工具 '%s' 调用失败: %s", tname, e)
             return f"[MCP调用错误] {e}"
 
     # 创建异步调用函数
@@ -308,7 +226,12 @@ def create_mcp_tool_instance(
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
             result = await conn.call_tool(tname, filtered_kwargs)
-            return _format(result)
+            result_str = _format(result)
+            if use_chrome_formatter and mcp_manager:
+                mcp_manager.apply_browser_after_execution(
+                    tname, filtered_kwargs, result_str
+                )
+            return result_str
         except Exception as e:
             return f"[MCP调用错误] {e}"
 

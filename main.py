@@ -29,6 +29,19 @@ class _McpCancelScopeFilter(logging.Filter):
         return True
 
 
+class _McpProcessTermFilter(logging.Filter):
+    """过滤 MCP 进程组终止失败的警告。
+
+    npx 子进程在 macOS 上无法通过 process group 方式终止（Operation not permitted），
+    mcp 库会 fallback 到 simple terminate，功能不受影响。
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "Process group termination failed" in msg and "falling back to simple terminate" in msg:
+            return False
+        return True
+
+
 def main():
     # 配置日志：默认 WARNING，可通过 --debug 参数启用 DEBUG
     log_level = logging.DEBUG if "--debug" in sys.argv else logging.WARNING
@@ -41,6 +54,11 @@ def main():
     # 静默 MCP 断开连接时的 cancel scope 跨 task 警告
     logging.getLogger("mcp_client.client").addFilter(
         _McpCancelScopeFilter()
+    )
+
+    # 静默 MCP 进程组终止失败的警告（macOS 上 npx 子进程的已知行为）
+    logging.getLogger("mcp.os.posix.utilities").addFilter(
+        _McpProcessTermFilter()
     )
 
     # 解析命令行参数

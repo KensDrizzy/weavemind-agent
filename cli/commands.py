@@ -286,7 +286,10 @@ def _handle_hitl(parts: list, agent_loop):
         status = "启用" if hitl_handler.is_enabled() else "禁用"
         approved_count = hitl_handler.approved_all_count()
         console.print(f"\n[cyan]HITL 当前状态：{status}[/cyan]")
-        console.print(f"[dim]已全部放行的工具：{approved_count} 个[/dim]\n")
+        if approved_count == -1:
+            console.print("[dim]已全局放行所有工具[/dim]\n")
+        else:
+            console.print(f"[dim]已全部放行的工具：{approved_count} 个[/dim]\n")
     else:
         console.print("\n[yellow]用法: /hitl [on|off|status][/yellow]")
         console.print("[dim]  on     启用人工审批[/dim]")
@@ -454,112 +457,63 @@ def _show_mcp_health(mcp_manager):
 
 
 def _handle_browser(parts: list, mcp_manager=None):
-    """处理 /browser 命令 — 查看浏览器模式、切换 isolated/shared 模式。
+    """处理 /browser 命令 — 查看浏览器模式、切换模式。
 
     用法：
         /browser           显示浏览器当前模式
         /browser status    显示浏览器详细状态
-        /browser shared    切换到 shared 模式（连接用户 Chrome，继承登录态）
-        /browser isolated  切换回 isolated 模式（独立浏览器，无登录态）
+        /browser connect   切换到 shared 模式（autoConnect，Chrome 144+）
+        /browser connect <port>  旧式端口连接
+        /browser disconnect  切换回 isolated 模式
     """
     if not mcp_manager:
         console.print("\n[red]❌ MCP Manager 未初始化[/red]")
-        console.print("[dim]请在 config.yaml 中设置 mcp.enabled: true 并配置 Chrome Server[/dim]\n")
+        console.print("[dim]请在 config.yaml 中设置 mcp.enabled: true 并配置 chrome-devtools Server[/dim]\n")
         return
 
     subcmd = parts[1] if len(parts) > 1 else "status"
 
     if subcmd == "status":
         _show_browser_status(mcp_manager)
-    elif subcmd == "shared":
-        _switch_browser_shared(mcp_manager)
-    elif subcmd == "isolated":
+    elif subcmd == "connect":
+        port = None
+        if len(parts) > 2:
+            try:
+                port = int(parts[2])
+            except ValueError:
+                console.print(f"\n[red]❌ 无效端口: {parts[2]}[/red]\n")
+                return
+        _switch_browser_shared(mcp_manager, port)
+    elif subcmd == "disconnect":
         _switch_browser_isolated(mcp_manager)
     else:
-        console.print("\n[yellow]用法: /browser [status|shared|isolated][/yellow]")
-        console.print("[dim]  status    显示浏览器当前模式和状态[/dim]")
-        console.print("[dim]  shared    切换到 shared 模式（连接用户 Chrome，继承登录态）[/dim]")
-        console.print("[dim]  isolated  切换回 isolated 模式（独立浏览器，无登录态）[/dim]\n")
+        console.print("\n[yellow]用法: /browser [status|connect|disconnect][/yellow]")
+        console.print("[dim]  status      显示浏览器当前模式和状态[/dim]")
+        console.print("[dim]  connect     切换到 shared 模式（autoConnect，Chrome 144+）[/dim]")
+        console.print("[dim]  connect <port>  旧式端口连接[/dim]")
+        console.print("[dim]  disconnect  切换回 isolated 模式[/dim]\n")
 
 
 def _show_browser_status(mcp_manager):
     """显示浏览器当前状态。"""
-    session_manager = mcp_manager.get_session_manager()
-    browser_guard = mcp_manager.get_browser_guard()
-
-    # 模式信息
-    mode = mcp_manager.get_chrome_mode() or "未启动"
-    mode_label = {
-        "isolated": "isolated (独立浏览器，无登录态)",
-        "shared": "shared (连接用户 Chrome，有登录态)",
-    }.get(mode, mode)
-
-    status_table = Table(
-        title="🌐 浏览器模式",
-        show_header=True,
-        header_style="bold cyan",
-    )
-    status_table.add_column("项目", style="cyan", width=12)
-    status_table.add_column("值", style="dim")
-
-    status_table.add_row("当前模式", mode_label)
-
-    # Session manager 详情
-    if session_manager:
-        status_text = session_manager.get_status_text()
-        for line in status_text.split("\n"):
-            if ":" in line:
-                key, val = line.split(":", 1)
-                status_table.add_row(key.strip(), val.strip())
-    else:
-        status_table.add_row("会话管理", "未初始化")
-
-    # BrowserGuard 信息
-    if browser_guard:
-        from mcp_client.browser_guard import BrowserGuard
-        pattern_count = len(browser_guard._patterns)
-        status_table.add_row("敏感规则", f"{pattern_count} 条")
-    else:
-        status_table.add_row("敏感保护", "未启用")
-
-    # AutoConnectDiscovery 状态
-    from mcp_client.auto_connect import AutoConnectDiscovery
-    discovery = AutoConnectDiscovery()
-    is_debugging = discovery.is_remote_debugging_enabled()
-    status_table.add_row("用户 Chrome 调试", f"{'✅ 已开启' if is_debugging else '❌ 未开启'}")
-
-    if is_debugging:
-        browser_url = discovery.get_browser_url()
-        status_table.add_row("发现地址", browser_url or "未知")
+    status_text = mcp_manager.get_browser_status_text()
 
     console.print()
-    console.print(status_table)
+    console.print(Panel(status_text, title="🌐 浏览器状态", border_style="cyan"))
 
-    # 提示信息
+    mode = mcp_manager.get_chrome_mode()
     if mode == "isolated":
         console.print("\n[dim]💡 当前为 isolated 模式，无法访问需要登录的页面[/dim]")
-        console.print("[dim]   输入 /browser shared 切换到 shared 模式（需要用户 Chrome 开启远程调试）[/dim]")
+        console.print("[dim]   输入 /browser connect 切换到 shared 模式[/dim]")
+        console.print("[dim]   或让 Agent 自动调用 browser_connect 工具[/dim]")
     elif mode == "shared":
         console.print("\n[dim]💡 当前为 shared 模式，可以访问需要登录的页面[/dim]")
         console.print("[dim]   注意：shared 模式下敏感页面的写操作需要用户确认[/dim]")
     console.print()
 
 
-def _switch_browser_shared(mcp_manager):
+def _switch_browser_shared(mcp_manager, port=None):
     """切换到 shared 模式。"""
-    # 先检查用户 Chrome 是否开启了远程调试
-    from mcp_client.auto_connect import AutoConnectDiscovery
-    discovery = AutoConnectDiscovery()
-
-    if not discovery.is_remote_debugging_enabled():
-        console.print("\n[red]❌ 未发现开启远程调试的用户 Chrome[/red]")
-        console.print("[dim]请按以下步骤开启 Chrome 远程调试：[/dim]")
-        console.print("[dim]  1. 在 Chrome 地址栏输入 chrome://inspect/#remote-debugging[/dim]")
-        console.print("[dim]  2. 打开 \"Allow remote debugging for this browser instance\" 开关[/dim]")
-        console.print("[dim]  3. 需要 Chrome 144+ 版本[/dim]")
-        console.print()
-        return
-
     console.print("\n[cyan]🔄 正在切换到 shared 模式...[/cyan]")
 
     import asyncio
@@ -568,10 +522,27 @@ def _switch_browser_shared(mcp_manager):
         if loop.is_running():
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, mcp_manager.switch_to_shared())
+                if port:
+                    future = pool.submit(
+                        asyncio.run,
+                        mcp_manager._restart_chrome_server(
+                            ["-y", "chrome-devtools-mcp@latest", "--browserUrl", f"http://localhost:{port}"],
+                            "shared",
+                        )
+                    )
+                else:
+                    future = pool.submit(asyncio.run, mcp_manager.switch_to_shared())
                 success = future.result(timeout=30)
         else:
-            success = asyncio.run(mcp_manager.switch_to_shared())
+            if port:
+                success = asyncio.run(
+                    mcp_manager._restart_chrome_server(
+                        ["-y", "chrome-devtools-mcp@latest", "--browserUrl", f"http://localhost:{port}"],
+                        "shared",
+                    )
+                )
+            else:
+                success = asyncio.run(mcp_manager.switch_to_shared())
     except Exception as e:
         console.print(f"\n[red]❌ 切换失败: {e}[/red]\n")
         return
@@ -582,16 +553,24 @@ def _switch_browser_shared(mcp_manager):
         console.print("[dim]   注意：敏感页面的写操作需要用户确认[/dim]\n")
     else:
         console.print("[red]❌ 切换失败[/red]")
-        console.print("[dim]   可能原因：MCP Server 重启失败[/dim]\n")
+        if not port:
+            console.print("[dim]   可能原因：[/dim]")
+            console.print("[dim]   1. Chrome 未开启远程调试（Chrome 144+ 请在 chrome://inspect/#remote-debugging 勾选）[/dim]")
+            console.print("[dim]   2. Chrome 未运行[/dim]")
+            console.print("[dim]   3. MCP Server 重启失败[/dim]")
+            console.print("[dim]   尝试 /browser connect 9222 使用旧式端口连接[/dim]")
+        else:
+            console.print("[dim]   可能原因：MCP Server 重启失败或端口不可用[/dim]")
+        console.print()
 
 
 def _switch_browser_isolated(mcp_manager):
     """切换回 isolated 模式。"""
-    if mcp_manager.is_shared_mode():
-        console.print("\n[cyan]🔄 正在切换回 isolated 模式...[/cyan]")
-    else:
+    if mcp_manager.is_isolated_mode():
         console.print("\n[dim]当前已是 isolated 模式[/dim]\n")
         return
+
+    console.print("\n[cyan]🔄 正在切换回 isolated 模式...[/cyan]")
 
     import asyncio
     try:

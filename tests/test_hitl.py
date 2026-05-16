@@ -203,7 +203,7 @@ class TestTerminalHitlHandler:
 
     @patch("cli.hitl_handler.console")
     def test_approval_approved_all(self, mock_console):
-        """输入 a 应返回 APPROVED_ALL 并记录工具名。"""
+        """输入 a 应返回 APPROVED_ALL 并设置全局放行。"""
         handler = TerminalHitlHandler()
         handler.set_enabled(True)
         mock_console.input.side_effect = ["a"]
@@ -217,7 +217,7 @@ class TestTerminalHitlHandler:
         )
         result = handler.request_approval(req)
         assert result.decision == ApprovalDecision.APPROVED_ALL
-        assert "Bash" in handler._approved_all_tools
+        assert handler._approved_all_global is True
 
     @patch("cli.hitl_handler.console")
     def test_approval_skipped(self, mock_console):

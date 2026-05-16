@@ -33,10 +33,25 @@ class MCPConnection:
         self._tools_info: list[MCPToolInfo] = []
         self._connected: bool = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None  # 保存连接时的事件循环
+        self._last_error: Optional[str] = None  # 最后一次连接错误信息
 
     def _detect_server_type(self) -> str:
-        """根据配置特征检测 server 类型，用于差异化处理。"""
+        """根据配置特征检测 server 类型，用于差异化处理。
+
+        Chrome DevTools MCP Server 的识别方式：
+        1. 配置中有 chrome 子键（旧格式）
+        2. server 名称包含 "chrome" 或 "devtools"
+        3. 启动参数包含 "chrome-devtools-mcp"
+        """
+        # 旧格式：配置中有 chrome 子键
         if "chrome" in self.config and isinstance(self.config["chrome"], dict):
+            return "chrome"
+        # 新格式：server 名称或命令中包含 chrome-devtools
+        name = self.config.get("name", "")
+        if "chrome" in name.lower() or "devtools" in name.lower():
+            return "chrome"
+        args = self.config.get("args", [])
+        if any("chrome-devtools-mcp" in str(a) for a in args):
             return "chrome"
         return "generic"
 
@@ -51,38 +66,49 @@ class MCPConnection:
             bool: 连接是否成功
         """
         self._exit_stack = AsyncExitStack()
+        self._last_error = None
 
         try:
             if self.transport == "stdio":
-                success = await self._connect_stdio()
+                success, error_msg = await self._connect_stdio()
+                if not success:
+                    self._last_error = error_msg
+                    return False
             elif self.transport in ("http", "sse"):
                 success = await self._connect_http()
+                if not success:
+                    return False
             else:
                 raise ValueError(f"不支持的传输方式: {self.transport}")
 
-            if success:
-                # 获取并缓存工具列表
-                tools_response = await self._session.list_tools()
-                self._tools_info = tools_response.tools
-                self._connected = True
-                self._loop = asyncio.get_event_loop()  # 保存连接时的事件循环
+            # 获取并缓存工具列表
+            tools_response = await self._session.list_tools()
+            self._tools_info = tools_response.tools
+            self._connected = True
+            self._loop = asyncio.get_event_loop()  # 保存连接时的事件循环
 
-                logger.info(
-                    "MCP Server '%s' 连接成功，发现 %d 个工具: %s",
-                    self.name,
-                    len(self._tools_info),
-                    [t.name for t in self._tools_info],
-                )
-                return True
+            logger.info(
+                "MCP Server '%s' 连接成功，发现 %d 个工具: %s",
+                self.name,
+                len(self._tools_info),
+                [t.name for t in self._tools_info],
+            )
+            return True
 
         except Exception as e:
+            self._last_error = str(e)
             logger.error("连接 MCP Server '%s' 失败: %s", self.name, e)
             await self.disconnect()
             return False
 
-    async def _connect_stdio(self) -> bool:
-        """建立 stdio 传输连接（本地子进程）。"""
-        import subprocess
+    async def _connect_stdio(self) -> tuple:
+        """建立 stdio 传输连接（本地子进程）。
+        
+        Returns:
+            tuple: (success: bool, error_msg: str) 
+        """
+        import os
+        from datetime import timedelta
 
         params = StdioServerParameters(
             command=self.config["command"],
@@ -90,16 +116,21 @@ class MCPConnection:
             env=self._merge_env(),
         )
 
-        # 将 MCP 子进程 stderr 重定向到 DEVNULL，避免启动信息直接打印到终端
-        # 注意：不能用 io.StringIO()，因为 subprocess 需要真实的文件描述符（fileno）
-        read, write = await self._exit_stack.enter_async_context(
-            stdio_client(params, errlog=subprocess.DEVNULL)
-        )
-        self._session = await self._exit_stack.enter_async_context(
-            ClientSession(read, write)
-        )
-        await self._session.initialize()
-        return True
+        try:
+            # 抑制 MCP Server 的 stderr 输出（如 chrome-devtools-mcp 的启动 banner）
+            devnull = open(os.devnull, "w")
+            self._exit_stack.callback(devnull.close)
+            read, write = await self._exit_stack.enter_async_context(
+                stdio_client(params, errlog=devnull)
+            )
+            self._session = await self._exit_stack.enter_async_context(
+                ClientSession(read, write, read_timeout_seconds=timedelta(seconds=60))
+            )
+            await self._session.initialize()
+            return True, ""
+        except Exception as e:
+            error_msg = str(e)
+            return False, error_msg
 
     async def _connect_http(self) -> bool:
         """建立 HTTP/SSE 传输连接（远程服务）。"""
@@ -179,3 +210,7 @@ class MCPConnection:
     def is_connected(self) -> bool:
         """检查连接状态。"""
         return self._connected
+
+    def get_last_error(self) -> Optional[str]:
+        """获取最后一次连接错误信息。"""
+        return self._last_error

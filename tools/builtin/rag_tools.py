@@ -52,10 +52,9 @@ class SearchCodeTool(WeaveMindTool):
 
     name: str = "SearchCode"
     description: str = (
-        "语义检索代码库，根据自然语言描述查找相关代码块。"
+        "语义检索本地代码库，根据自然语言描述查找相关代码块。"
         "支持自然语言描述（如'用户认证逻辑'）和代码标识符精确匹配（如'MemoryManager'）。"
-        "用于理解代码结构、定位实现、查找参考。"
-        "当用户询问代码库相关问题时优先使用。"
+        "仅用于查找本地项目代码，不要用于访问 URL 或搜索互联网内容。"
     )
     args_schema: Type[BaseModel] = SearchCodeInput
 

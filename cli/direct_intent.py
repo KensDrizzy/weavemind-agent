@@ -53,6 +53,10 @@ class DirectIntentHandler:
         """尝试处理用户输入，返回 AI 回复文本或 None（表示回退 LLM）。"""
         text = user_input.strip()
 
+        # 包含 URL 的输入不走直达，交给 LLM 处理
+        if re.search(r'https?://', text):
+            return None
+
         # 按优先级尝试各意图
         for handler in [
             self._try_list_dir,
