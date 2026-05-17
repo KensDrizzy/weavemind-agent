@@ -72,6 +72,8 @@ class AgentLoop:
         model: str = None,
         force_plan_mode: bool = False,
         mcp_manager=None,
+        skill_registry=None,
+        skill_buffer=None,
     ):
         self.tool_registry = tool_registry
         self.permission_policy = permission_policy
@@ -81,7 +83,9 @@ class AgentLoop:
         self.model = model
         self.force_plan_mode = force_plan_mode
         self.mcp_manager = mcp_manager
-        self.mode = "default"  # 权限模式，可选: default, ask, acceptEdits, bypassPermissions
+        self.skill_registry = skill_registry
+        self.skill_buffer = skill_buffer
+        self.mode = "default"
         self._model_call_count = 0
         self._tool_unavailable_reasons: dict[str, str] = {}
         self._tool_failure_counts: dict[str, int] = {}
@@ -212,14 +216,20 @@ class AgentLoop:
     _BROWSER_REPEAT_TOOLS = frozenset({
         "take_screenshot", "take_snapshot",
     })
-    _BROWSER_LOOP_WINDOW = 16  # 检查窗口大小
+    # 导航类工具 — 表示 Agent 在不同页面间移动（有进展）
+    _BROWSER_NAVIGATION_TOOLS = frozenset({
+        "navigate_page", "new_page", "close_page",
+    })
+    _BROWSER_LOOP_WINDOW = 20  # 检查窗口大小（扩大以容纳多页提取场景）
 
     def _detect_browser_loop(self, messages: list) -> bool:
         """检测浏览器工具是否陷入重复循环。
 
         策略：
-        1. 检查最近 16 条工具调用中 screenshot/snapshot 是否 ≥5 次（纯重复截图）
+        1. 检查最近窗口中 screenshot/snapshot 是否 ≥5 次（纯重复截图）
         2. 检查是否出现相同的 3-tool 序列重复 ≥3 次（模式重复）
+           但排除包含 evaluate_script 且窗口内有导航操作的情况（合法的多页提取）
+        3. 检查 evaluate_script 是否在无导航的情况下连续调用 ≥6 次（单页死循环）
         触发后注入停止指令。
         """
         # 从 AIMessage.tool_calls 提取工具名（比 ToolMessage.name 更可靠）
@@ -244,15 +254,44 @@ class AgentLoop:
             self._inject_stop_message(messages, "重复截图/快照过多")
             return True
 
-        # 检测 2：3-gram 模式重复
         recent_tool_names.reverse()  # 恢复时间顺序
+
+        # 检测 2：evaluate_script 无导航连续调用（单页死循环）
+        # 找最后一次导航操作的位置，之后连续 evaluate_script 的次数
+        last_nav_idx = -1
+        for i in range(len(recent_tool_names) - 1, -1, -1):
+            if recent_tool_names[i] in self._BROWSER_NAVIGATION_TOOLS:
+                last_nav_idx = i
+                break
+        # 从最后一次导航之后算连续 evaluate_script
+        tail = recent_tool_names[last_nav_idx + 1:]
+        consecutive_eval = 0
+        for t in reversed(tail):
+            if t == "evaluate_script":
+                consecutive_eval += 1
+            else:
+                break
+        if consecutive_eval >= 6:
+            self._inject_stop_message(messages, f"evaluate_script 无导航连续调用 {consecutive_eval} 次")
+            return True
+
+        # 检测 3：3-gram 模式重复（排除有导航进展的合法浏览模式）
+        has_navigation = any(t in self._BROWSER_NAVIGATION_TOOLS for t in recent_tool_names)
         trigrams = [tuple(recent_tool_names[i:i+3]) for i in range(len(recent_tool_names) - 2)]
         if trigrams:
             from collections import Counter
             most_common = Counter(trigrams).most_common(1)[0]
             if most_common[1] >= 3:
-                self._inject_stop_message(messages, f"工具序列 {most_common[0]} 重复 {most_common[1]} 次")
-                return True
+                pattern = most_common[0]
+                # 如果模式中包含导航工具，说明 Agent 在不同页面间移动，是正常浏览
+                has_nav_in_pattern = any(t in self._BROWSER_NAVIGATION_TOOLS for t in pattern)
+                # 如果模式全是 evaluate_script 且窗口内有导航，是多页提取
+                all_eval = set(pattern) == {"evaluate_script"}
+                if has_nav_in_pattern or (all_eval and has_navigation):
+                    pass  # 合法的多页内容提取/浏览模式
+                else:
+                    self._inject_stop_message(messages, f"工具序列 {pattern} 重复 {most_common[1]} 次")
+                    return True
 
         return False
 
@@ -261,8 +300,8 @@ class AgentLoop:
         logger.warning("检测到浏览器循环（%s），注入停止指令", reason)
         messages.append(SystemMessage(content=(
             "[系统中断] 你已经陷入重复的浏览器操作循环。\n"
-            "请立即停止，根据已获取的内容进行总结回复用户。\n"
-            "不要再调用 take_screenshot 或 take_snapshot。"
+            "请立即停止所有浏览器工具调用，根据已获取的内容进行总结回复用户。\n"
+            "不要再调用 take_screenshot、take_snapshot 或 evaluate_script。"
         )))
 
     def _build_graph(self) -> StateGraph:
@@ -305,6 +344,13 @@ class AgentLoop:
 
         # 首次调用时注入系统提示（每次重新构建，包含最新记忆和检索结果）
         if self.memory:
+            # 注入 Skill 索引到 system prompt
+            if self.skill_registry:
+                from skills.formatter import SkillIndexFormatter
+                self.memory._skill_index = SkillIndexFormatter.format(self.skill_registry.enabled_skills())
+            else:
+                self.memory._skill_index = ""
+
             # 从最新用户消息中提取查询词，用于记忆检索
             query = ""
             for m in reversed(messages):
@@ -318,6 +364,16 @@ class AgentLoop:
                     messages = [system_msg] + list(messages[1:])
                 else:
                     messages = [system_msg] + list(messages)
+
+        # Skill body 注入：drain buffer 并 prepend 到最新 user message
+        if self.skill_buffer and not self.skill_buffer.is_empty():
+            drained = self.skill_buffer.drain()
+            if drained:
+                for i in range(len(messages) - 1, -1, -1):
+                    if isinstance(messages[i], HumanMessage):
+                        original = messages[i].content
+                        messages[i] = HumanMessage(content=drained + "用户输入：\n" + original)
+                        break
 
         # 自动压缩检查（在 LLM 调用前）
         if self.compactor.should_compact(messages):

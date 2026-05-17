@@ -86,6 +86,9 @@ class WeaveMindCLI:
         self.mcp_manager = MCPManager()
         self._mcp_initialized = False
 
+        # 初始化 Skill 系统
+        self._init_skills()
+
         self._create_agent_loop()
         self._direct_intent = DirectIntentHandler(self.tool_registry)
 
@@ -96,7 +99,7 @@ class WeaveMindCLI:
         # 创建命令补全器
         commands = [
             "/help", "/memory", "/save", "/sessions", "/mode", "/plan", "/team",
-            "/hitl", "/mcp", "/browser", "/index", "/search", "/clear", "/exit", "/quit"
+            "/hitl", "/mcp", "/browser", "/skill", "/index", "/search", "/clear", "/exit", "/quit"
         ]
         completer = FuzzyCompleter(WordCompleter(commands, ignore_case=True))
         key_bindings = self._build_key_bindings()
@@ -134,6 +137,23 @@ class WeaveMindCLI:
 
         return bindings
 
+    def _init_skills(self):
+        """初始化 Skill 系统。"""
+        from pathlib import Path
+        from skills.registry import SkillRegistry
+        from skills.state_store import SkillStateStore
+        from skills.buffer import SkillContextBuffer
+
+        builtin_dir = Path(__file__).parent.parent / "skills" / "builtin"
+        user_dir = Path.home() / ".weavemind" / "skills"
+        project_dir = Path(".weavemind") / "skills"
+        state_file = Path.home() / ".weavemind" / "skills.json"
+
+        self.skill_state_store = SkillStateStore(state_file)
+        self.skill_registry = SkillRegistry(builtin_dir, user_dir, project_dir, self.skill_state_store)
+        self.skill_registry.reload()
+        self.skill_buffer = SkillContextBuffer()
+
     def _create_agent_loop(self, force_plan: bool = False):
         """重建 ToolRegistry 和 AgentLoop，同时重建意图直达处理器。"""
         self.tool_registry = HitlToolRegistry(
@@ -142,6 +162,13 @@ class WeaveMindCLI:
             rag_pipeline=self.rag_pipeline,
             mcp_manager=self.mcp_manager if self._mcp_initialized else None,
         )
+        # 注册 load_skill 工具
+        if self.skill_registry:
+            from tools.builtin.skill_tools import LoadSkillTool
+            self.tool_registry.register(LoadSkillTool(
+                skill_registry=self.skill_registry,
+                skill_buffer=self.skill_buffer,
+            ))
         # 让 MCPManager 持有 ToolRegistry 引用，以便模式切换时同步更新
         self.mcp_manager._tool_registry = self.tool_registry
         self._direct_intent = DirectIntentHandler(self.tool_registry)
@@ -152,6 +179,8 @@ class WeaveMindCLI:
             memory=self.memory,
             force_plan_mode=force_plan,
             mcp_manager=self.mcp_manager if self._mcp_initialized else None,
+            skill_registry=self.skill_registry,
+            skill_buffer=self.skill_buffer,
         )
 
     def _init_mcp_sync(self):
@@ -212,6 +241,9 @@ class WeaveMindCLI:
                             tool_preview += f"... (+{len(tools)-3})"
                         console.print(f"[dim]   • {server}: {tool_preview}[/dim]")
                     console.print()
+
+                # 显示 Skill 加载信息
+                self._print_skills_info()
         except Exception as e:
             logger.warning(f"MCP 异步初始化失败: {e}")
 
@@ -240,6 +272,29 @@ class WeaveMindCLI:
         logger.info(f"任务复杂度: {complexity}")
         return complexity == "complex"
 
+    def _print_skills_info(self):
+        """打印 Skill 加载汇总。"""
+        if not self.skill_registry:
+            return
+        enabled = self.skill_registry.enabled_skills()
+        if not enabled:
+            return
+        console.print(f"[dim]📚 Skills 加载（{len(enabled)} 个）...[/dim]")
+        for skill in enabled:
+            desc = skill.description.replace("\n", " ").strip()
+            # 按显示宽度截断（CJK 字符占 2 列）
+            max_width = 80
+            width = 0
+            cut = len(desc)
+            for i, ch in enumerate(desc):
+                width += 2 if ord(ch) > 0x7F else 1
+                if width > max_width:
+                    cut = i
+                    break
+            if cut < len(desc):
+                desc = desc[:cut] + "..."
+            console.print(f"[dim]   ✓ {skill.name:<16} {skill.display_source():<8} {desc}[/dim]")
+
     def _print_banner(self):
         """打印启动欢迎界面。"""
         banner = r"""
@@ -264,6 +319,10 @@ class WeaveMindCLI:
         
         # 异步初始化 MCP
         self._init_mcp_sync()
+
+        # 显示 Skill 加载信息（独立于 MCP）
+        if not self._mcp_initialized:
+            self._print_skills_info()
         
         console.print(Panel(
             "[bold]WeaveMind Agent[/bold]\n"

@@ -349,6 +349,10 @@ class MemoryManager:
         # 5. 行为规范
         parts.append(self._behavior_guide())
 
+        # 6. Skill 索引（由外部传入）
+        if hasattr(self, '_skill_index') and self._skill_index:
+            parts.append(self._skill_index)
+
         content = "\n\n".join(p for p in parts if p and p.strip())
         return SystemMessage(content=content) if content else None
 

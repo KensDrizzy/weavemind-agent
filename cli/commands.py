@@ -33,6 +33,7 @@ def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None, mcp
         help_table.add_row("/hitl [on|off|status]", "人工审批模式（默认启用，/hitl off 关闭）")
         help_table.add_row("/mcp [status|tools|health]", "查看 MCP 连接状态、工具列表、健康检查")
         help_table.add_row("/browser [status|shared|isolated]", "查看浏览器模式、切换 isolated/shared 模式")
+        help_table.add_row("/skill [list|show|on|off|reload]", "管理 Skills（经验复用）")
         help_table.add_row("/plan", "切换 Plan-Execute 模式（复杂任务先规划后执行）")
         help_table.add_row("/team", "切换 Multi-Agent 模式（多角色分工+审查验收）")
         help_table.add_row("/clear", "清空屏幕")
@@ -95,6 +96,9 @@ def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None, mcp
 
     elif name == "/browser":
         _handle_browser(parts, mcp_manager)
+
+    elif name == "/skill":
+        _handle_skill(parts, agent_loop)
 
     elif name in ("/exit", "/quit"):
         raise SystemExit(0)
@@ -591,3 +595,64 @@ def _switch_browser_isolated(mcp_manager):
         console.print("[dim]   浏览器将使用独立实例，无登录态[/dim]\n")
     else:
         console.print("[red]❌ 切换失败[/red]\n")
+
+
+def _handle_skill(parts: list, agent_loop):
+    """处理 /skill 命令。"""
+    subcmd = parts[1] if len(parts) > 1 else "list"
+    registry = getattr(agent_loop, 'skill_registry', None)
+    if not registry:
+        console.print("\n[yellow]Skill 系统未初始化[/yellow]\n")
+        return
+
+    if subcmd == "list":
+        skills = registry.all_skills()
+        disabled = registry.state_store.disabled() if registry.state_store else set()
+        if not skills:
+            console.print("\n[dim]无可用 Skills[/dim]\n")
+            return
+        console.print(f"\n[cyan]📚 Skills ({len(skills)} 个)[/cyan]\n")
+        for s in skills:
+            status = "✗" if s.name in disabled else "●"
+            desc = s.description.replace("\n", " ").strip()
+            console.print(f"  {status} {s.name:20} {s.display_source():8}")
+            if desc:
+                console.print(f"    {desc}")
+        console.print()
+
+    elif subcmd == "show":
+        name = parts[2] if len(parts) > 2 else ""
+        if not name:
+            console.print("\n[yellow]用法: /skill show <name>[/yellow]\n")
+            return
+        skill = registry.find_any(name)
+        if not skill:
+            console.print(f"\n[red]未找到 Skill: {name}[/red]\n")
+            return
+        console.print(f"\n[cyan]## {skill.name}[/cyan] ({skill.display_source()})")
+        if skill.version:
+            console.print(f"[dim]version: {skill.version}[/dim]")
+        console.print(f"\n{skill.body[:3000]}\n")
+
+    elif subcmd == "on":
+        name = parts[2] if len(parts) > 2 else ""
+        if not name or not registry.state_store:
+            console.print("\n[yellow]用法: /skill on <name>[/yellow]\n")
+            return
+        registry.state_store.enable(name)
+        console.print(f"\n[green]✓ 已启用 Skill: {name}[/green]\n")
+
+    elif subcmd == "off":
+        name = parts[2] if len(parts) > 2 else ""
+        if not name or not registry.state_store:
+            console.print("\n[yellow]用法: /skill off <name>[/yellow]\n")
+            return
+        registry.state_store.disable(name)
+        console.print(f"\n[yellow]✗ 已禁用 Skill: {name}[/yellow]\n")
+
+    elif subcmd == "reload":
+        registry.reload()
+        console.print(f"\n[green]✓ 已重载 Skills ({len(registry.enabled_skills())} 个启用)[/green]\n")
+
+    else:
+        console.print("\n[yellow]用法: /skill [list|show|on|off|reload][/yellow]\n")
