@@ -58,3 +58,22 @@ rag:
     strategy: hybrid
     top_k: 10
     max_per_file: 2
+  query_rewrite:
+    enabled: true
+    method: rules          # rules | llm
+    max_queries: 3
+    # provider/model 可选；不填则复用 llm.provider / llm.model
+    provider:
+    model:
+  rerank:
+    enabled: true
+    method: heuristic      # heuristic | cross_encoder | llm
+    top_n: 20              # 先召回 top_n 候选，再重排取 top_k
+    model: cross-encoder/ms-marco-MiniLM-L-6-v2  # cross_encoder 使用，需安装 sentence-transformers
+    # llm_model 可选；method=llm 时不填则复用 llm.model
+    provider:
+    llm_model:
+  cache:
+    enabled: true
+    ttl_seconds: 300
+    max_entries: 128

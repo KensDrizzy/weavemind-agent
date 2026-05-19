@@ -448,3 +448,81 @@ class TestRetrievalResult:
         assert "0.85" in text
         assert "```python" in text
         assert "def search" in text
+
+
+# ── Retrieval enhancement tests ─────────────────────────────────
+
+
+class TestRetrievalEnhancements:
+    """query rewrite、rerank、search cache 测试。"""
+
+    def _result(self, name, content, score=0.2, parent_name=None):
+        from rag.models import CodeChunk, RetrievalResult
+
+        chunk = CodeChunk(
+            file_path="core/memory.py",
+            chunk_type="method",
+            name=name,
+            content=content,
+            start_line=1,
+            end_line=10,
+            parent_name=parent_name,
+            signature=f"def {name}(self):",
+            language="python",
+        )
+        return RetrievalResult(chunk=chunk, score=score, semantic_score=score)
+
+    def test_query_rewrite_expands_code_terms(self):
+        from rag.retrieval_enhancements import QueryRewriter
+
+        rewriter = QueryRewriter()
+        variants = rewriter.rewrite("MemoryManager 缓存")
+
+        assert variants[0] == "MemoryManager 缓存"
+        assert any("Memory Manager" in q for q in variants)
+        assert any("cache" in q for q in variants)
+
+    def test_heuristic_rerank_promotes_matching_symbol(self):
+        from rag.retrieval_enhancements import ResultReranker
+
+        reranker = ResultReranker()
+        reranker.enabled = True
+        reranker.method = "heuristic"
+
+        relevant = self._result(
+            "search",
+            "def search(self, query): return self.store.get(query)",
+            parent_name="MemoryManager",
+        )
+        unrelated = self._result(
+            "render",
+            "def render(self): return '<html></html>'",
+            parent_name="Renderer",
+        )
+
+        ranked = reranker.rerank(
+            "MemoryManager search",
+            [unrelated, relevant],
+            top_k=2,
+            query_variants=["MemoryManager search Memory Manager"],
+        )
+
+        assert ranked[0].chunk.name == "search"
+
+    def test_search_cache_uses_fingerprint_and_returns_copy(self):
+        from rag.retrieval_enhancements import SearchCache
+
+        cache = SearchCache()
+        cache.enabled = True
+        cache.ttl_seconds = 30
+        cache.max_entries = 2
+        result = self._result("search", "def search(self): pass")
+
+        cache.set("k", "fp1", [result])
+        cached = cache.get("k", "fp1")
+        assert cached is not None
+        cached[0].score = 0.0
+
+        cached_again = cache.get("k", "fp1")
+        assert cached_again[0].score == result.score
+        assert cache.get("k", "fp2") is None

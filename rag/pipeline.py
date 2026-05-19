@@ -27,6 +27,7 @@ from rag.chunkers import (
     CODE_EXTENSIONS,
 )
 from rag.keyword_index import KeywordIndex
+from rag.retrieval_enhancements import QueryRewriter, ResultReranker, SearchCache
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,9 @@ class CodeRAGPipeline:
         )
         self._indexed_files: dict = {}  # file_path -> {hash, timestamp}
         self._load_metadata()
+        self.query_rewriter = QueryRewriter()
+        self.reranker = ResultReranker()
+        self.search_cache = SearchCache()
 
     # ── 索引 ──────────────────────────────────────────────
 
@@ -149,6 +153,7 @@ class CodeRAGPipeline:
             "source": source,
         }
         self._save_metadata()
+        self._clear_search_cache()
 
         logger.info(f"索引完成: {file_path} → {len(chunks)} 个代码块 (source={source})")
         return len(chunks)
@@ -263,12 +268,40 @@ class CodeRAGPipeline:
         Returns:
             检索结果列表，按分数降序
         """
+        query_variants = self.query_rewriter.rewrite(query)
+        if not query_variants:
+            return []
+
+        index_fingerprint = self._index_fingerprint()
+        cache_key = SearchCache.make_key(
+            query=query,
+            variants=query_variants,
+            top_k=top_k,
+            file_filter=file_filter,
+            source_filter=source_filter,
+            strategy=strategy,
+            rerank=self.reranker.method if self.reranker.enabled else "off",
+        )
+        cached = self.search_cache.get(cache_key, index_fingerprint)
+        if cached is not None:
+            return cached
+
+        candidate_k = self._candidate_limit(top_k)
         if strategy == "semantic":
-            return self._semantic_search(query, top_k, file_filter, source_filter)
+            results = self._semantic_search_many(query_variants, candidate_k, file_filter, source_filter)
         elif strategy == "keyword":
-            return self._keyword_search(query, top_k, file_filter, source_filter)
+            results = self._keyword_search_many(query_variants, candidate_k, file_filter, source_filter)
         else:
-            return self._hybrid_search(query, top_k, file_filter, source_filter)
+            results = self._hybrid_search(query, candidate_k, file_filter, source_filter, query_variants=query_variants)
+
+        results = self.reranker.rerank(
+            query=query,
+            results=results,
+            top_k=top_k,
+            query_variants=query_variants,
+        )
+        self.search_cache.set(cache_key, index_fingerprint, results)
+        return results
 
     def _semantic_search(
         self, query: str, top_k: int,
@@ -322,6 +355,18 @@ class CodeRAGPipeline:
 
         return results[:top_k]
 
+    def _semantic_search_many(
+        self, queries: List[str], top_k: int,
+        file_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
+    ) -> List[RetrievalResult]:
+        """Run semantic search for rewritten queries and merge candidates."""
+        results = []
+        per_query_k = max(top_k, 1)
+        for q in queries:
+            results.extend(self._semantic_search(q, per_query_k, file_filter, source_filter))
+        return self._merge_results(results)[:top_k]
+
     def _keyword_search(
         self, query: str, top_k: int,
         file_filter: Optional[str] = None,
@@ -343,10 +388,23 @@ class CodeRAGPipeline:
             )
         return results
 
+    def _keyword_search_many(
+        self, queries: List[str], top_k: int,
+        file_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
+    ) -> List[RetrievalResult]:
+        """Run keyword search for rewritten queries and merge candidates."""
+        results = []
+        per_query_k = max(top_k, 1)
+        for q in queries:
+            results.extend(self._keyword_search(q, per_query_k, file_filter, source_filter))
+        return self._merge_results(results)[:top_k]
+
     def _hybrid_search(
         self, query: str, top_k: int,
         file_filter: Optional[str] = None,
         source_filter: Optional[str] = None,
+        query_variants: Optional[List[str]] = None,
     ) -> List[RetrievalResult]:
         """混合检索：语义 + 关键词 + 评分融合 + 同文件去重。
 
@@ -356,9 +414,11 @@ class CodeRAGPipeline:
                     + type_boost * 0.1
                     + dual_hit_bonus * 0.1
         """
+        queries = query_variants or [query]
+
         # 1. 分别召回候选集
-        semantic_results = self._semantic_search(query, top_k=top_k * 2, file_filter=file_filter, source_filter=source_filter)
-        keyword_results = self._keyword_search(query, top_k=top_k * 2, file_filter=file_filter, source_filter=source_filter)
+        semantic_results = self._semantic_search_many(queries, top_k=top_k * 2, file_filter=file_filter, source_filter=source_filter)
+        keyword_results = self._keyword_search_many(queries, top_k=top_k * 2, file_filter=file_filter, source_filter=source_filter)
 
         # 2. 合并去重（以 file_path+name 为唯一键）
         merged: dict = {}  # key -> RetrievalResult
@@ -408,6 +468,23 @@ class CodeRAGPipeline:
         return self._deduplicate_by_file(sorted_results, max_per_file=2)[:top_k]
 
     @staticmethod
+    def _merge_results(results: List[RetrievalResult]) -> List[RetrievalResult]:
+        """Merge duplicate chunks returned by query variants."""
+        merged: dict = {}
+        for r in results:
+            key = f"{r.chunk.file_path}::{r.chunk.name}::{r.chunk.start_line}"
+            if key not in merged:
+                merged[key] = r
+                continue
+            existing = merged[key]
+            existing.semantic_score = max(existing.semantic_score, r.semantic_score)
+            existing.keyword_score = max(existing.keyword_score, r.keyword_score)
+            existing.score = max(existing.score, r.score)
+            if existing.source != r.source:
+                existing.source = "hybrid"
+        return sorted(merged.values(), key=lambda x: -x.score)
+
+    @staticmethod
     def _deduplicate_by_file(
         results: List[RetrievalResult], max_per_file: int = 2
     ) -> List[RetrievalResult]:
@@ -421,6 +498,12 @@ class CodeRAGPipeline:
                 deduped.append(r)
                 file_counts[fp] = count + 1
         return deduped
+
+    def _candidate_limit(self, top_k: int) -> int:
+        """Return number of candidates to collect before final reranking."""
+        if not self.reranker.enabled:
+            return top_k
+        return max(top_k, int(settings.get("rag.rerank.top_n", 20)))
 
     # ── 统计与元数据 ──────────────────────────────────────
 
@@ -520,6 +603,17 @@ class CodeRAGPipeline:
         with open(self._metadata_path, "w", encoding="utf-8") as f:
             json.dump(self._indexed_files, f, ensure_ascii=False, indent=2)
 
+    def _index_fingerprint(self) -> str:
+        """Cheap fingerprint for invalidating cached search results."""
+        if not self._indexed_files:
+            return "empty"
+        max_ts = max(float(m.get("timestamp", 0)) for m in self._indexed_files.values())
+        return f"{len(self._indexed_files)}:{max_ts:.6f}"
+
+    def _clear_search_cache(self):
+        if hasattr(self, "search_cache"):
+            self.search_cache.clear()
+
     # ── 新鲜度检测与增量同步 ──────────────────────────────
 
     def sync_before_search(self, source_filter: str = None) -> dict:
@@ -581,6 +675,7 @@ class CodeRAGPipeline:
         # 持久化 metadata
         if updated > 0 or deleted_count > 0 or new_indexed > 0:
             self._save_metadata()
+            self._clear_search_cache()
 
         result = {
             "updated": updated,

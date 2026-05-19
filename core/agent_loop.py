@@ -275,7 +275,11 @@ class AgentLoop:
             self._inject_stop_message(messages, f"evaluate_script 无导航连续调用 {consecutive_eval} 次")
             return True
 
-        # 检测 3：3-gram 模式重复（排除有导航进展的合法浏览模式）
+        # 检测 3：3-gram 模式重复（仅针对浏览器相关工具）
+        _BROWSER_TOOLS = self._BROWSER_REPEAT_TOOLS | self._BROWSER_NAVIGATION_TOOLS | {
+            "evaluate_script", "click", "drag", "type_text",
+            "browser_connect", "browser_disconnect",
+        }
         has_navigation = any(t in self._BROWSER_NAVIGATION_TOOLS for t in recent_tool_names)
         trigrams = [tuple(recent_tool_names[i:i+3]) for i in range(len(recent_tool_names) - 2)]
         if trigrams:
@@ -283,6 +287,10 @@ class AgentLoop:
             most_common = Counter(trigrams).most_common(1)[0]
             if most_common[1] >= 3:
                 pattern = most_common[0]
+                # 只有模式中至少包含一个浏览器工具时才视为浏览器循环
+                has_browser_tool = any(t in _BROWSER_TOOLS for t in pattern)
+                if not has_browser_tool:
+                    return False  # 非浏览器工具重复（如 Read/Glob），不算循环
                 # 如果模式中包含导航工具，说明 Agent 在不同页面间移动，是正常浏览
                 has_nav_in_pattern = any(t in self._BROWSER_NAVIGATION_TOOLS for t in pattern)
                 # 如果模式全是 evaluate_script 且窗口内有导航，是多页提取
@@ -358,6 +366,7 @@ class AgentLoop:
                     query = m.content[:100]
                     break
 
+            # 构建 system message（含 CLAUDE.md + MEMORY.md + skill 索引）
             system_msg = self.memory.build_system_message(query)
             if system_msg:
                 if messages and isinstance(messages[0], SystemMessage):

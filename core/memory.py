@@ -310,50 +310,61 @@ class MemoryManager:
         """构建完整的 system prompt。
 
         组装顺序：
-        1. CLAUDE.md（项目规范）
-        2. .weavemind/MEMORY.md（项目记忆）
-        3. CoreMemory 块（用户/项目/人设）
-        4. 检索到的相关长期记忆事实
-        5. 行为规范
+        1. 动态记忆上下文（CLAUDE.md + MEMORY.md + CoreMemory + 相关事实）
+        2. base.md（Identity + Language + Tools + Tool Policy + Browser + Safety）
+        3. personality.md
+        4. mode 提示词
+        5. Skill 索引
+        6. context-management.md
+        7. handoff.md
         """
-        parts = []
+        from core.prompt_assembler import PromptAssembler, PromptMode
 
-        # 1. CLAUDE.md
+        # 组装动态记忆上下文
+        memory_parts = []
+
+        # CLAUDE.md
         if os.path.exists(self._claude_md):
             try:
                 with open(self._claude_md, encoding="utf-8") as f:
-                    parts.append(f.read())
+                    memory_parts.append(f.read())
             except Exception:
                 pass
 
-        # 2. MEMORY.md
+        # MEMORY.md
         if os.path.exists(self._memory_md):
             try:
                 with open(self._memory_md, encoding="utf-8") as f:
-                    parts.append(f.read())
+                    memory_parts.append(f.read())
             except Exception:
                 pass
 
-        # 3. CoreMemory
+        # CoreMemory
         core_prompt = self.core.to_prompt()
         if core_prompt:
-            parts.append(core_prompt)
+            memory_parts.append(core_prompt)
 
-        # 4. 检索相关事实
+        # 检索相关事实
         if query:
             relevant = self.long_term.search(query, limit=5)
             if relevant:
                 facts_text = "\n".join(f"- {e.content}" for e in relevant)
-                parts.append(f"## 相关记忆\n{facts_text}")
+                memory_parts.append(f"## 相关记忆\n{facts_text}")
 
-        # 5. 行为规范
-        parts.append(self._behavior_guide())
+        memory_context = "\n\n".join(p for p in memory_parts if p and p.strip()) or None
 
-        # 6. Skill 索引（由外部传入）
-        if hasattr(self, '_skill_index') and self._skill_index:
-            parts.append(self._skill_index)
+        # Skill 索引
+        skill_index = self._skill_index if hasattr(self, '_skill_index') and self._skill_index else None
 
-        content = "\n\n".join(p for p in parts if p and p.strip())
+        # 使用 PromptAssembler 组装
+        if not hasattr(self, '_prompt_assembler'):
+            self._prompt_assembler = PromptAssembler()
+
+        content = self._prompt_assembler.assemble(
+            mode=PromptMode.AGENT,
+            memory_context=memory_context,
+            skill_index=skill_index,
+        )
         return SystemMessage(content=content) if content else None
 
     def store_fact(self, content: str, metadata: dict = None) -> bool:
@@ -388,48 +399,5 @@ class MemoryManager:
 
     @staticmethod
     def _behavior_guide() -> str:
-        return """## Identity
-
-你是 WeaveMind Agent，一个面向代码库工作的智能编程 Agent。
-
-## Language
-
-请用中文回复用户。代码、命令、文件名、API 名称保留原文。
-
-## Tool Policy
-
-工具选择的核心决策规则（按优先级排序）：
-
-1. 用户输入包含 URL（http/https）→ 根据 URL 类型选择：
-   - 小红书/淘宝/微博等 SPA 站点 → 浏览器 MCP（navigate_page + take_snapshot）
-   - 微信公众号/语雀等需要登录的站点 → 浏览器 MCP
-   - 静态页面（博客/文档/GitHub README）→ WebFetch
-2. 用户要求搜索互联网信息（"搜一下"/"最新"/"查一下"）且不涉及代码库 → WebSearch
-3. 用户询问代码库相关问题（类名/方法名/实现逻辑）→ SearchCode
-4. 用户要求操作文件/执行命令 → Read/Write/Edit/Bash
-5. 稳定知识（语法/概念/算法）→ 直接回答，不调用工具
-
-补充规则：
-- 已有具体 URL 时直接访问，不要先 WebSearch 再访问。
-- WebFetch 返回空内容或防爬提示时，自动 fallback 到浏览器 MCP，不要重复抓取。
-- 代码库问题用 SearchCode 一次召回，不要用 Read+Glob+Grep 逐个读文件。
-- 同一轮不要重复调用相同工具获取相同信息。
-- 简单问题直接回答，不要为了展示过程而调用无关工具。
-
-## Browser Policy
-
-- 静态/SSR 页面优先 WebFetch。
-- SPA、需要 JS 渲染、防爬墙、需要登录态或表单交互时使用浏览器 MCP。
-- 浏览器读取优先 take_snapshot + evaluate_script 提取文本，不要默认 take_screenshot。
-- 浏览器 MCP 返回登录页/权限不足时，先调用 browser_connect 连接用户 Chrome，再重试。
-- 公开页面不需要登录态时，不要提前调用 browser_connect。
-
-## Safety Policy
-
-- Bash 禁止 sudo、rm -rf /、curl|sh 等危险命令。
-- 执行破坏性操作前必须确认。
-- 不确定就直接说，不要乱猜。
-
-## Handoff
-
-最终回复聚焦用户目标：说明完成了什么、还有哪些边界。不要虚构未执行的操作。"""
+        """已废弃 — 提示词已迁移到 prompts/ 目录下的 .md 文件。"""
+        return ""
