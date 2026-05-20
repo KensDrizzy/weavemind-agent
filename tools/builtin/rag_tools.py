@@ -34,6 +34,10 @@ class SearchCodeInput(BaseModel):
         default=None,
         description="索引源过滤，如 'weavemind' 只搜索该项目的代码"
     )
+    chat_history: Optional[str] = Field(
+        default=None,
+        description="最近对话摘要，用于改写'它/这个/刚才'等指代不明的检索问题"
+    )
 
 
 class SearchCodeTool(WeaveMindTool):
@@ -62,7 +66,14 @@ class SearchCodeTool(WeaveMindTool):
         super().__init__()
         self._rag_pipeline = rag_pipeline
 
-    def _run(self, query: str, top_k: int = 5, file_filter: Optional[str] = None, source: Optional[str] = None) -> str:
+    def _run(
+        self,
+        query: str,
+        top_k: int = 5,
+        file_filter: Optional[str] = None,
+        source: Optional[str] = None,
+        chat_history: Optional[str] = None,
+    ) -> str:
         if not self._rag_pipeline:
             return """错误：代码检索服务未初始化。
 
@@ -91,7 +102,8 @@ class SearchCodeTool(WeaveMindTool):
         try:
             results = self._rag_pipeline.search(
                 query=query, top_k=top_k, file_filter=file_filter,
-                source_filter=source, strategy="hybrid"
+                source_filter=source, strategy="hybrid",
+                chat_history=[chat_history] if chat_history else None,
             )
         except Exception as e:
             logger.error(f"代码检索失败: {e}")

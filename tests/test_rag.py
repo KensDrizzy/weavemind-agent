@@ -482,6 +482,42 @@ class TestRetrievalEnhancements:
         assert any("Memory Manager" in q for q in variants)
         assert any("cache" in q for q in variants)
 
+    def test_auto_query_rewrite_uses_history_for_contextual_question(self, monkeypatch):
+        from rag.retrieval_enhancements import QueryRewriter
+
+        rewriter = QueryRewriter()
+        rewriter.method = "auto"
+        monkeypatch.setattr(
+            rewriter,
+            "_llm_variants",
+            lambda query, chat_history=None, symbols=None: [
+                "MemoryManager LongTermMemory CoreMemory 持久化 JSON"
+            ],
+        )
+
+        variants = rewriter.rewrite(
+            "那它是怎么持久化的？",
+            chat_history=["user: 解释一下 WeaveMind 的 memory 机制"],
+            symbols=["LongTermMemory | type=class | file=core/memory.py"],
+        )
+
+        assert variants[0] == "那它是怎么持久化的？"
+        assert any("LongTermMemory" in q for q in variants)
+
+    def test_code_symbol_query_stays_rule_only_in_auto_mode(self, monkeypatch):
+        from rag.retrieval_enhancements import QueryRewriter
+
+        rewriter = QueryRewriter()
+        rewriter.method = "auto"
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("LLM rewrite should not run for explicit symbols")
+
+        monkeypatch.setattr(rewriter, "_llm_variants", fail_if_called)
+        variants = rewriter.rewrite("MemoryManager")
+        assert variants[0] == "MemoryManager"
+        assert any("Memory Manager" in q for q in variants)
+
     def test_heuristic_rerank_promotes_matching_symbol(self):
         from rag.retrieval_enhancements import ResultReranker
 
@@ -526,3 +562,20 @@ class TestRetrievalEnhancements:
         cached_again = cache.get("k", "fp1")
         assert cached_again[0].score == result.score
         assert cache.get("k", "fp2") is None
+
+    def test_keyword_index_symbol_hints(self, tmp_path):
+        from rag.keyword_index import KeywordIndex
+
+        idx = KeywordIndex(db_path=str(tmp_path / "kw.db"))
+        try:
+            idx.add_chunks([
+                self._result(
+                    "LongTermMemory",
+                    "class LongTermMemory: pass",
+                    parent_name=None,
+                ).chunk
+            ])
+            hints = idx.get_symbol_hints("memory 机制", limit=5)
+            assert any("LongTermMemory" in hint for hint in hints)
+        finally:
+            idx.close()

@@ -4,6 +4,8 @@ import pytest
 import json
 from unittest.mock import MagicMock, patch
 
+from langchain_core.messages import AIMessage
+
 from agents.agent_state import MultiAgentState
 from agents.reviewer import parse_review_approval, create_reviewer_node, MAX_RETRIES
 from agents.orchestrator import make_supervisor_node, MultiAgentOrchestrator
@@ -469,3 +471,34 @@ class TestShouldAutoTeam:
                 "team.auto_detect": False,
             }.get(key, default)
             assert cli._should_auto_team("创建一个项目") is False
+
+    def test_plan_mode_has_priority_over_auto_team(self):
+        """/plan 显式开启时，复杂任务不应被自动切到 Multi-Agent。"""
+        from cli.app import WeaveMindCLI
+
+        cli = WeaveMindCLI.__new__(WeaveMindCLI)
+        cli.plan_mode = True
+        cli.team_mode = False
+        cli.conversation = []
+        cli.hitl_handler = MagicMock()
+        cli.hitl_handler.is_enabled.return_value = True
+        cli._has_shown_hitl_hint = True
+        cli._has_shown_rag_hint = True
+        cli.rag_pipeline = None
+        cli.stream_details_expanded = False
+        cli.stream_renderer = MagicMock()
+        cli.stream_renderer.has_streamed_answer = False
+        cli.session_manager = MagicMock()
+        cli.session_manager.create.return_value = "test-session"
+        cli._should_auto_team = MagicMock(return_value=True)
+        cli._run_multi_agent = MagicMock()
+        cli.agent_loop = MagicMock()
+        cli.agent_loop.stream_with_history = MagicMock(return_value=iter([
+            {"execute_plan": {"messages": [AIMessage(content="计划执行完成")]}}
+        ]))
+
+        cli._run_agent("创建一个项目并运行测试")
+
+        cli._should_auto_team.assert_not_called()
+        cli._run_multi_agent.assert_not_called()
+        cli.agent_loop.stream_with_history.assert_called_once()

@@ -10,6 +10,7 @@ FTS5 是 SQLite 内置的全文搜索引擎，无需额外服务。
 import json
 import logging
 import os
+import re
 import sqlite3
 from typing import List, Optional, Tuple
 
@@ -235,6 +236,56 @@ class KeywordIndex:
             "SELECT DISTINCT file_path FROM chunk_metadata"
         )
         return [row[0] for row in cursor]
+
+    def get_symbol_hints(
+        self,
+        query: str,
+        source_filter: Optional[str] = None,
+        limit: int = 40,
+    ) -> List[str]:
+        """Return real project symbols that may help LLM query rewrite.
+
+        This is intentionally metadata-only and cheap. The returned strings are
+        used as hints, not as search results.
+        """
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[\u4e00-\u9fff]{2,}", query)
+        like_terms = [f"%{t}%" for t in tokens[:6]]
+
+        sql = """
+            SELECT DISTINCT file_path, chunk_type, name, parent_name, signature
+            FROM chunk_metadata
+            WHERE name != ''
+        """
+        params: list = []
+
+        if like_terms:
+            clauses = []
+            for term in like_terms:
+                clauses.append("(name LIKE ? OR parent_name LIKE ? OR file_path LIKE ? OR signature LIKE ?)")
+                params.extend([term, term, term, term])
+            sql += " AND (" + " OR ".join(clauses) + ")"
+
+        if source_filter:
+            sql += " AND metadata LIKE ?"
+            params.append(f'%"source": "{source_filter}"%')
+
+        sql += " ORDER BY chunk_type, name LIMIT ?"
+        params.append(limit)
+
+        try:
+            cursor = self._conn.execute(sql, params)
+        except sqlite3.OperationalError as e:
+            logger.debug(f"symbol hint query failed: {e}")
+            return []
+
+        hints = []
+        for file_path, chunk_type, name, parent, signature in cursor:
+            symbol = f"{parent}.{name}" if parent else name
+            details = [symbol, f"type={chunk_type}", f"file={file_path}"]
+            if signature:
+                details.append(f"signature={signature}")
+            hints.append(" | ".join(details))
+        return hints
 
     def close(self):
         """关闭数据库连接。"""

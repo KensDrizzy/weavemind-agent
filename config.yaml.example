@@ -60,8 +60,9 @@ rag:
     max_per_file: 2
   query_rewrite:
     enabled: true
-    method: rules          # rules | llm
+    method: rules          # rules | llm | auto
     max_queries: 3
+    symbol_limit: 40       # LLM/auto 改写时提供的项目符号候选数量
     # provider/model 可选；不填则复用 llm.provider / llm.model
     provider:
     model:

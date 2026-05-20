@@ -430,8 +430,9 @@ class WeaveMindCLI:
             self._run_multi_agent(user_input)
             return
 
-        # 自动判断复杂度，复杂任务走 Team 模式
-        if self._should_auto_team(user_input):
+        # 自动判断复杂度，复杂任务走 Team 模式。
+        # 手动 /plan 是显式执行意图，优先级高于自动 Team 检测。
+        if not self.plan_mode and self._should_auto_team(user_input):
             console.print("[dim]检测到复杂任务，自动切换到 Multi-Agent 模式[/dim]")
             self._run_multi_agent(user_input)
             return

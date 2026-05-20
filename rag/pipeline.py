@@ -255,6 +255,7 @@ class CodeRAGPipeline:
         file_filter: Optional[str] = None,
         source_filter: Optional[str] = None,
         strategy: str = "hybrid",
+        chat_history: Optional[list] = None,
     ) -> List[RetrievalResult]:
         """检索代码库。
 
@@ -264,11 +265,17 @@ class CodeRAGPipeline:
             file_filter: 文件路径过滤（如 '*.py'）
             source_filter: 索引源过滤（如 'weavemind' 只搜该项目的代码）
             strategy: 检索策略 semantic/keyword/hybrid
+            chat_history: 可选最近对话，用于 LLM query rewrite 消解指代
 
         Returns:
             检索结果列表，按分数降序
         """
-        query_variants = self.query_rewriter.rewrite(query)
+        symbol_hints = self._symbol_hints_for_rewrite(query, source_filter)
+        query_variants = self.query_rewriter.rewrite(
+            query,
+            chat_history=chat_history,
+            symbols=symbol_hints,
+        )
         if not query_variants:
             return []
 
@@ -281,6 +288,7 @@ class CodeRAGPipeline:
             source_filter=source_filter,
             strategy=strategy,
             rerank=self.reranker.method if self.reranker.enabled else "off",
+            history=self._history_cache_key(chat_history),
         )
         cached = self.search_cache.get(cache_key, index_fingerprint)
         if cached is not None:
@@ -504,6 +512,31 @@ class CodeRAGPipeline:
         if not self.reranker.enabled:
             return top_k
         return max(top_k, int(settings.get("rag.rerank.top_n", 20)))
+
+    def _symbol_hints_for_rewrite(
+        self, query: str, source_filter: Optional[str] = None
+    ) -> List[str]:
+        """Fetch project-local symbols to constrain LLM query rewrite."""
+        try:
+            return self.keyword_index.get_symbol_hints(
+                query=query,
+                source_filter=source_filter,
+                limit=int(settings.get("rag.query_rewrite.symbol_limit", 40)),
+            )
+        except Exception as e:
+            logger.debug(f"symbol hints unavailable: {e}")
+            return []
+
+    @staticmethod
+    def _history_cache_key(chat_history: Optional[list]) -> str:
+        if not chat_history:
+            return ""
+        parts = []
+        for item in chat_history[-8:]:
+            text = item if isinstance(item, str) else getattr(item, "content", "")
+            if text:
+                parts.append(str(text).replace("\n", " ")[:200])
+        return "\n".join(parts)
 
     # ── 统计与元数据 ──────────────────────────────────────
 

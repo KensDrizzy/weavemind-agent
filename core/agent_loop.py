@@ -56,7 +56,7 @@ COMPLEXITY_PROMPT = (
 class AgentState(TypedDict):
     """Agent 循环状态。"""
     messages: Annotated[list[BaseMessage], add_messages]
-    plan: Optional[dict]  # 当前执行计划（序列化后的 Plan）
+    plan: Optional[dict]  # 当前执行计划（序列化后的 Plan）  plan 的直接作用是：把 Planner 生成的计划保存到图状态里，让下一个节点能拿到。
 
 
 class AgentLoop:
@@ -327,8 +327,9 @@ class AgentLoop:
         # 设置入口
         graph.set_entry_point("think")
 
-        # 添加边
+        # 固定流转边
         graph.add_edge("think", "route")
+        # 条件分支边
         graph.add_conditional_edges("route", self._should_continue, {
             "continue": "plan_or_react",
             "end": END,
@@ -610,6 +611,8 @@ class AgentLoop:
         """判断是否继续循环。"""
         last_message = state["messages"][-1]
         # Plan 模式：首次进入时继续，计划执行后结束，避免循环
+        # 如果是 Plan 模式，并且 state["plan"] 还没有生成 → 继续走 plan
+        # 如果 state["plan"] 已经存在 → 说明计划已经生成/执行过 → 结束
         if self.force_plan_mode:
             return "continue" if state.get("plan") is None else "end"
         # 硬性迭代上限
@@ -665,6 +668,25 @@ class AgentLoop:
 
         return {}
 
+    @staticmethod
+    def _format_recent_chat_history(messages: list, max_messages: int = 8) -> str:
+        """Format recent human/assistant text for contextual RAG query rewrite."""
+        lines = []
+        for msg in messages:
+            if isinstance(msg, (ToolMessage, SystemMessage)):
+                continue
+            content = getattr(msg, "content", "")
+            if not content or not isinstance(content, str):
+                continue
+            if isinstance(msg, HumanMessage):
+                role = "user"
+            elif isinstance(msg, AIMessage):
+                role = "assistant"
+            else:
+                role = msg.__class__.__name__
+            lines.append(f"{role}: {content.replace(chr(10), ' ')[:500]}")
+        return "\n".join(lines[-max_messages:])
+
     def _act(self, state: AgentState) -> dict:
         """执行工具调用。"""
         last_message = state["messages"][-1]
@@ -676,6 +698,15 @@ class AgentLoop:
         for tool_call in last_message.tool_calls:
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
+
+            # Give SearchCode enough context to rewrite follow-up questions like
+            # "那它在哪里调用" into a code-searchable query. Existing callers can
+            # still pass chat_history explicitly; this only fills the blank.
+            if tool_name == "SearchCode" and isinstance(tool_args, dict) and not tool_args.get("chat_history"):
+                history = self._format_recent_chat_history(state["messages"][:-1])
+                if history:
+                    tool_args = dict(tool_args)
+                    tool_args["chat_history"] = history
 
             # 运行环境不可用：直接返回可解释错误，避免模型反复重试
             unavailable_reason = self._tool_unavailable_reasons.get(tool_name)

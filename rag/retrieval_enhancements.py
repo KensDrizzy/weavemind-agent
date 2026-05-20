@@ -54,13 +54,24 @@ class QueryRewriter:
         "失败": ["error", "exception", "failure"],
     }
 
+    _CONTEXTUAL_HINTS = (
+        "它", "这个", "上面", "刚才", "前面", "该", "这些", "那个",
+        "机制", "流程", "架构", "怎么实现", "如何实现", "为什么",
+        "调用链", "在哪里调用", "初始化", "持久化",
+    )
+
     def __init__(self):
         self.enabled = settings.get("rag.query_rewrite.enabled", True)
         self.method = settings.get("rag.query_rewrite.method", "rules")
         self.max_queries = int(settings.get("rag.query_rewrite.max_queries", 3))
         self._llm = None
 
-    def rewrite(self, query: str) -> List[str]:
+    def rewrite(
+        self,
+        query: str,
+        chat_history: Optional[Iterable] = None,
+        symbols: Optional[List[str]] = None,
+    ) -> List[str]:
         """Return query variants with the original query first."""
         query = (query or "").strip()
         if not query:
@@ -71,23 +82,26 @@ class QueryRewriter:
         variants = [query]
         variants.extend(self._rule_variants(query))
 
-        if self.method == "llm":
-            variants.extend(self._llm_variants(query))
+        if self.method == "llm" or (
+            self.method == "auto" and self._should_use_llm(query, variants, chat_history)
+        ):
+            variants.extend(self._llm_variants(query, chat_history, symbols))
 
         return self._dedupe(variants)[: max(1, self.max_queries)]
 
     def _rule_variants(self, query: str) -> List[str]:
         terms = []
 
+        # 标识符拆分
         for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", query):
             split = self._split_identifier(token)
             if split and split.lower() != token.lower():
                 terms.append(split)
-
+        # 中文同义词
         for needle, expansions in self._CODE_SYNONYMS.items():
             if needle in query:
                 terms.extend(expansions)
-
+        # 合并输出
         variants = []
         if terms:
             expanded = " ".join(self._dedupe(terms))
@@ -99,27 +113,48 @@ class QueryRewriter:
 
         return variants
 
-    def _llm_variants(self, query: str) -> List[str]:
+    def _llm_variants(
+        self,
+        query: str,
+        chat_history: Optional[Iterable] = None,
+        symbols: Optional[List[str]] = None,
+    ) -> List[str]:
         try:
-            llm = self._get_llm()
+            llm = self._get_llm()  # 获取llm实例
             if not llm:
                 return []
             from langchain_core.messages import HumanMessage, SystemMessage
 
+            history_text = self._format_chat_history(chat_history)
+            symbol_text = "\n".join(f"- {s}" for s in (symbols or [])[:40])
             messages = [
                 SystemMessage(
                     content=(
-                        "You rewrite code-search queries. Return only a JSON "
-                        "array of up to 3 concise search queries. Preserve code "
-                        "identifiers and add likely English identifiers for "
-                        "Chinese terms."
+                        "You are a codebase RAG query rewriting assistant. "
+                        "Rewrite the user's current question into up to 3 concise "
+                        "queries suitable for code semantic search and BM25 search. "
+                        "Resolve vague references such as 'it', 'this', 'above', "
+                        "or 'that mechanism' using chat history. Preserve existing "
+                        "code identifiers. Add likely English code terms for Chinese "
+                        "intent words. If project symbols are provided, prefer them "
+                        "and do not invent class/function names. Return only a JSON "
+                        "array of strings."
                     )
                 ),
-                HumanMessage(content=query),
+                HumanMessage(
+                    content=json.dumps(
+                        {
+                            "user_question": query,
+                            "recent_chat_history": history_text,
+                            "project_symbol_candidates": symbol_text,
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
             ]
-            response = llm.invoke(messages)
+            response = llm.invoke(messages)  # 调用llm
             text = getattr(response, "content", str(response))
-            parsed = _extract_json_array(text)
+            parsed = _extract_json_array(text)   # 解析 JSON 数组
             return [str(x).strip() for x in parsed if str(x).strip()]
         except Exception as e:
             logger.debug(f"LLM query rewrite failed: {e}")
@@ -145,6 +180,58 @@ class QueryRewriter:
         token = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", token)
         token = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", token)
         return token.strip()
+
+    def _should_use_llm(
+        self,
+        query: str,
+        rule_variants: List[str],
+        chat_history: Optional[Iterable] = None,
+    ) -> bool:
+        """Auto mode: upgrade to LLM for contextual or underspecified queries."""
+        if self._looks_like_code_symbol(query):
+            return False
+        if chat_history and any(hint in query for hint in self._CONTEXTUAL_HINTS):
+            return True
+        if len(rule_variants) <= 1 and len(query) > 12:
+            return True
+        if len(query) > 20 and any(hint in query for hint in self._CONTEXTUAL_HINTS):
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_code_symbol(query: str) -> bool:
+        stripped = query.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:]*", stripped):
+            return False
+        return bool(
+            re.search(r"[A-Z]", stripped)
+            or "_" in stripped
+            or "." in stripped
+            or "::" in stripped
+        )
+
+    @staticmethod
+    def _format_chat_history(chat_history: Optional[Iterable], max_chars: int = 1800) -> str:
+        """Format recent chat history without depending on a concrete message type."""
+        if not chat_history:
+            return ""
+
+        lines = []
+        for item in chat_history:
+            if isinstance(item, str):
+                text = item
+                role = "message"
+            else:
+                text = getattr(item, "content", "")
+                role = getattr(item, "type", None) or item.__class__.__name__
+            if not text:
+                continue
+            text = str(text).replace("\n", " ").strip()
+            if text:
+                lines.append(f"{role}: {text[:400]}")
+
+        formatted = "\n".join(lines[-8:])
+        return formatted[-max_chars:]
 
     @staticmethod
     def _dedupe(values: Iterable[str]) -> List[str]:
@@ -284,10 +371,13 @@ class ResultReranker:
         results: List[RetrievalResult],
         query_variants: Optional[List[str]] = None,
     ) -> List[RetrievalResult]:
+        # ① 把所有变体拼起来，提取查询词
         terms = _query_terms(" ".join(query_variants or [query]))
+        # ② 对每条结果计算启发式分数，与原分数加权融合
         for result in results:
             heuristic = self._heuristic_score(result, terms)
             result.score = 0.7 * result.score + 0.3 * heuristic
+        # ③ 重新排序
         return sorted(results, key=lambda x: -x.score)
 
     @staticmethod
