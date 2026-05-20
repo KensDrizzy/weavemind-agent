@@ -258,6 +258,8 @@ class MultiAgentOrchestrator:
             members.append(f"worker-{i + 1}")
         members.append("reviewer")
 
+        # 最终 members = ["planner", "worker-1", "worker-2", "reviewer"]
+
         builder = StateGraph(MultiAgentState)
 
         # 1. Supervisor 节点

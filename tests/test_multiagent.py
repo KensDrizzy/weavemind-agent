@@ -4,7 +4,7 @@ import pytest
 import json
 from unittest.mock import MagicMock, patch
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agents.agent_state import MultiAgentState
 from agents.reviewer import parse_review_approval, create_reviewer_node, MAX_RETRIES
@@ -502,3 +502,42 @@ class TestShouldAutoTeam:
         cli._should_auto_team.assert_not_called()
         cli._run_multi_agent.assert_not_called()
         cli.agent_loop.stream_with_history.assert_called_once()
+
+
+class TestConversationCompaction:
+    """测试 CLI 短期对话历史的压缩优先策略。"""
+
+    def test_compacts_before_trimming_when_message_limit_exceeded(self):
+        from cli.app import MAX_CONVERSATION_MESSAGES, WeaveMindCLI
+
+        cli = WeaveMindCLI.__new__(WeaveMindCLI)
+        cli.conversation = [
+            HumanMessage(content=f"message {i}")
+            for i in range(MAX_CONVERSATION_MESSAGES + 1)
+        ]
+        compacted = [SystemMessage(content="[对话历史摘要]")] + cli.conversation[-6:]
+        cli.agent_loop = MagicMock()
+        cli.agent_loop.compactor.compact.return_value = compacted
+
+        cli._compact_conversation_history()
+
+        cli.agent_loop.compactor.compact.assert_called_once()
+        assert cli.conversation == compacted
+
+    def test_trims_as_fallback_when_compaction_does_not_reduce_messages(self):
+        from cli.app import MAX_CONVERSATION_MESSAGES, WeaveMindCLI
+
+        cli = WeaveMindCLI.__new__(WeaveMindCLI)
+        original = [
+            HumanMessage(content=f"message {i}")
+            for i in range(MAX_CONVERSATION_MESSAGES + 5)
+        ]
+        cli.conversation = list(original)
+        cli.agent_loop = MagicMock()
+        cli.agent_loop.compactor.compact.return_value = list(original)
+
+        cli._compact_conversation_history()
+
+        cli.agent_loop.compactor.compact.assert_called_once()
+        assert len(cli.conversation) == MAX_CONVERSATION_MESSAGES
+        assert cli.conversation == original[-MAX_CONVERSATION_MESSAGES:]

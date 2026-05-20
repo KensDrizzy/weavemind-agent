@@ -34,6 +34,8 @@ import settings
 console = Console()
 logger = logging.getLogger(__name__)
 
+MAX_CONVERSATION_MESSAGES = 40  # 20 轮 × 2 条/轮
+
 
 class WeaveMindCLI:
     def __init__(self, hitl_enabled: bool = False):
@@ -468,14 +470,7 @@ class WeaveMindCLI:
         # 将用户输入加入对话历史
         self.conversation.append(HumanMessage(content=user_input))
 
-        # 对话历史长度保护：超过 20 轮自动截断旧消息（保留最近 10 轮）
-        MAX_CONVERSATION_MESSAGES = 40  # 20 轮 × 2 条/轮
-        if len(self.conversation) > MAX_CONVERSATION_MESSAGES:
-            kept = self.conversation[-MAX_CONVERSATION_MESSAGES:]
-            dropped = len(self.conversation) - len(kept)
-            self.conversation = kept
-            logger.info(f"对话历史过长，已截断 {dropped} 条旧消息")
-            console.print(f"[dim]对话历史过长，已自动截断 {dropped} 条旧消息[/dim]")
+        self._compact_conversation_history()
 
         self.stream_renderer.reset(expanded=self.stream_details_expanded)
         self.stream_renderer.start()
@@ -535,6 +530,41 @@ class WeaveMindCLI:
                 )
             except Exception:
                 pass  # 会话保存失败不影响主流程
+
+    def _compact_conversation_history(self):
+        """对话历史过长时先压缩，再用滑动窗口兜底裁剪。
+
+        固定消息数上限只是兜底保护。优先通过 ContextCompactor 把早期历史
+        摘要成一条 SystemMessage，并在压缩过程中沉淀关键事实，避免旧消息在
+        token 未超阈值时被直接丢弃。
+        """
+        if len(self.conversation) <= MAX_CONVERSATION_MESSAGES:
+            return
+
+        original_count = len(self.conversation)
+        compactor = getattr(getattr(self, "agent_loop", None), "compactor", None)
+        if compactor:
+            try:
+                compacted = compactor.compact(self.conversation)
+                if compacted and len(compacted) < original_count:
+                    self.conversation = compacted
+                    logger.info(
+                        "对话历史过长，已先压缩: %d 条 → %d 条",
+                        original_count,
+                        len(compacted),
+                    )
+                    console.print(
+                        f"[dim]对话历史过长，已先压缩为 {len(compacted)} 条消息[/dim]"
+                    )
+            except Exception as e:
+                logger.warning("对话历史压缩失败，回退到滑动窗口裁剪: %s", e)
+
+        if len(self.conversation) > MAX_CONVERSATION_MESSAGES:
+            kept = self.conversation[-MAX_CONVERSATION_MESSAGES:]
+            dropped = len(self.conversation) - len(kept)
+            self.conversation = kept
+            logger.info("对话历史过长，压缩后仍截断 %d 条旧消息", dropped)
+            console.print(f"[dim]对话历史过长，已裁剪 {dropped} 条旧消息[/dim]")
 
     def _run_multi_agent(self, user_input: str):
         """以 Multi-Agent 模式执行任务，流式输出每个 Agent 的执行进度。"""

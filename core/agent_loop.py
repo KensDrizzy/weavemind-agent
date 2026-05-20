@@ -459,6 +459,7 @@ class AgentLoop:
                     delta_text = self._extract_text_content(getattr(chunk, "content", ""))
                     if delta_text and self.hook_manager:
                         emitted_any_delta = True
+                        # 实时 emit 给前端渲染
                         self.hook_manager.emit("LLMDelta", {
                             "call_index": call_index,
                             "delta": delta_text,

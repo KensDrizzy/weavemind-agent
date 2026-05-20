@@ -64,9 +64,12 @@ class LongTermMemory:
     特性：
     - 启动时自动从磁盘加载
     - 内容去重（MD5 hash）
+    - 相似记忆更新（相似度 > 0.85 时替换旧内容）
     - 每次 store 即时持久化
     - 检索：子串匹配 + 字符 bigram 相似度 + 时间衰减
     """
+
+    UPDATE_SIMILARITY_THRESHOLD = 0.85
 
     def __init__(self, storage_path: str):
         self.storage_path = storage_path
@@ -105,7 +108,14 @@ class LongTermMemory:
         entry_type: Literal["fact", "summary"] = "fact",
         metadata: dict = None,
     ) -> bool:
-        """存储一条记忆。返回 True 表示新增，False 表示已存在（去重）。"""
+        """存储一条记忆。
+
+        返回 True 表示新增或更新，False 表示完全重复或内容无效。
+        写入流程：
+        1. 完全相同内容按 MD5 去重；
+        2. 与已有记忆相似度 > 0.85 时，视为长期记忆 update，原地替换旧内容；
+        3. 否则新增记忆。
+        """
         content = content.strip()
         if not content or len(content) < 3:
             return False
@@ -113,6 +123,37 @@ class LongTermMemory:
         content_hash = self._hash(content)
         if content_hash in self._entries:
             return False
+
+        similar = self._find_similar_entry(content, self.UPDATE_SIMILARITY_THRESHOLD)
+        if similar:
+            old_hash, entry, score = similar
+            old_content = entry.content
+            now = time.time()
+            merged_metadata = dict(entry.metadata or {})
+            if metadata:
+                merged_metadata.update(metadata)
+            merged_metadata.update({
+                "updated_at": now,
+                "updated_from": old_content,
+                "update_similarity": round(score, 4),
+            })
+
+            entry.content = content
+            entry.type = entry_type
+            entry.timestamp = now
+            entry.token_count = self._estimate_tokens(content)
+            entry.metadata = merged_metadata
+
+            del self._entries[old_hash]
+            self._entries[content_hash] = entry
+            self._save()
+            logger.info(
+                "长期记忆更新: similarity=%.4f, old=%s, new=%s",
+                score,
+                old_content[:50],
+                content[:50],
+            )
+            return True
 
         entry = MemoryEntry(
             id=uuid.uuid4().hex[:8],
@@ -126,6 +167,23 @@ class LongTermMemory:
         self._save()
         logger.info(f"长期记忆新增: {content[:50]}")
         return True
+
+    def _find_similar_entry(
+        self,
+        content: str,
+        threshold: float,
+    ) -> Optional[tuple[str, MemoryEntry, float]]:
+        """查找超过阈值的最相似记忆，用于 update 判断。"""
+        if not self._entries:
+            return None
+
+        content_lower = content.lower().strip()
+        best: tuple[str, MemoryEntry, float] | None = None
+        for content_hash, entry in self._entries.items():
+            score = self._bigram_similarity(content_lower, entry.content.lower().strip())
+            if score > threshold and (best is None or score > best[2]):
+                best = (content_hash, entry, score)
+        return best
 
     def search(self, query: str, limit: int = 5) -> list[MemoryEntry]:
         """检索相关记忆 — 子串匹配 + 字符 bigram 相似度 + 时间衰减。"""
