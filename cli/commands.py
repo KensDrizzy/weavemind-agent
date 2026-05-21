@@ -123,13 +123,23 @@ def _show_memory_status():
 
     mem = MemoryManager()
 
-    # 核心记忆
-    core_table = Table(title="🧠 核心记忆块", show_header=True, header_style="bold cyan")
-    core_table.add_column("块", style="cyan", width=10)
-    core_table.add_column("内容", style="dim")
+    # 核心记忆：每个 block 独立展示，避免多行内容让左右列视觉错位。
+    core_labels = {
+        "user": "用户偏好",
+        "project": "项目信息",
+        "persona": "Agent 行为",
+    }
+    core_blocks = []
     for block, content in mem.core.get_all().items():
-        display = content[:100] + "..." if len(content) > 100 else content
-        core_table.add_row(block, display or "(空)")
+        display = content.strip() or "(空)"
+        if len(display) > 600:
+            display = display[:600] + "\n...（内容较长，已截断显示）"
+        core_blocks.append(Panel(
+            Text(display, style="dim" if display != "(空)" else "dim italic"),
+            title=f"[cyan]{block}[/cyan] [dim]· {core_labels.get(block, '')}[/dim]",
+            border_style="cyan",
+            padding=(0, 1),
+        ))
 
     # 长期记忆
     facts = mem.long_term.get_all()
@@ -146,7 +156,9 @@ def _show_memory_status():
         facts_table.add_row("...", f"还有 {len(facts) - 10} 条")
 
     console.print()
-    console.print(core_table)
+    console.print("[bold]🧠 核心记忆块[/bold]")
+    for block_panel in core_blocks:
+        console.print(block_panel)
     if facts:
         console.print(facts_table)
     else:
