@@ -6,7 +6,7 @@ from core.planner import Planner
 from core.plan_executor import PlanExecutor
 from core.agent_loop import AgentLoop
 from hooks.manager import HookManager
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 
 def _make_fake_compactor():
@@ -162,6 +162,60 @@ class TestPlanner:
 
 
 class TestAgentLoop:
+    def _make_loop_for_searchcode(self, has_tool=True):
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.force_plan_mode = False
+        loop._tool_unavailable_reasons = {}
+        loop._disabled_tools = {}
+
+        class FakeRegistry:
+            def get(self, name):
+                if name == "SearchCode" and has_tool:
+                    return object()
+                return None
+
+        loop.tool_registry = FakeRegistry()
+        return loop
+
+    def test_force_search_code_for_codebase_question(self):
+        loop = self._make_loop_for_searchcode()
+        messages = [HumanMessage(content="解释一下 weavemind 的 mcp 实现")]
+
+        forced = loop._maybe_force_search_code(messages)
+
+        assert forced is not None
+        assert forced.tool_calls[0]["name"] == "SearchCode"
+        assert forced.tool_calls[0]["args"]["query"] == "解释一下 weavemind 的 mcp 实现"
+
+    def test_force_search_code_only_once_per_user_turn(self):
+        loop = self._make_loop_for_searchcode()
+        messages = [
+            HumanMessage(content="解释一下 weavemind 的 mcp 实现"),
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "SearchCode",
+                    "args": {"query": "解释一下 weavemind 的 mcp 实现", "top_k": 5},
+                    "id": "call_1",
+                }],
+            ),
+            ToolMessage(content="找到结果", tool_call_id="call_1", name="SearchCode"),
+        ]
+
+        assert loop._maybe_force_search_code(messages) is None
+
+    def test_force_search_code_skips_url_questions(self):
+        loop = self._make_loop_for_searchcode()
+        messages = [HumanMessage(content="解释一下 https://example.com 里的实现")]
+
+        assert loop._maybe_force_search_code(messages) is None
+
+    def test_force_search_code_requires_registered_tool(self):
+        loop = self._make_loop_for_searchcode(has_tool=False)
+        messages = [HumanMessage(content="解释一下 weavemind 的 mcp 实现")]
+
+        assert loop._maybe_force_search_code(messages) is None
+
     def test_should_continue_force_plan_stops_after_plan_ready(self):
         loop = AgentLoop.__new__(AgentLoop)
         loop.force_plan_mode = True

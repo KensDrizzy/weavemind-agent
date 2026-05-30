@@ -172,7 +172,8 @@ class MCPManager:
                                 self._chrome_mode = "isolated"
                             logger.info("检测到 Chrome DevTools MCP Server '%s'，初始模式: %s",
                                         name, self._chrome_mode)
-
+                            
+                        # 为该 Server 的每个工具创建 WeaveMindTool 实例
                         for tool_info in conn.get_tools_info():
                             try:
                                 tool_instance = create_mcp_tool_instance(

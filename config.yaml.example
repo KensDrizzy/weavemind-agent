@@ -45,6 +45,7 @@ tools:
 
 rag:
   enabled: false
+  force_search_code: true
   chroma_dir: .weavemind/chroma
   keyword_db: .weavemind/rag/keyword_index.db
   chunk_size: 500

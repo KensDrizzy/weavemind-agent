@@ -35,6 +35,7 @@ from core.plan_executor import PlanExecutor
 from hooks.manager import HookManager
 from permissions.policy import PermissionPolicy
 from tools.registry import ToolRegistry
+import settings
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -312,6 +313,98 @@ class AgentLoop:
             "不要再调用 take_screenshot、take_snapshot 或 evaluate_script。"
         )))
 
+    def _maybe_force_search_code(self, messages: list) -> Optional[AIMessage]:
+        """对代码库实现类问题强制首跳 SearchCode。
+
+        仅靠 prompt 要求模型优先用 SearchCode 不够稳定；当用户明确询问
+        本地代码库里的实现、架构、调用关系等问题时，这里在第一次 LLM
+        调用前直接构造一个 SearchCode tool_call。SearchCode 执行过后，
+        后续是否 Read 关键文件仍交给模型决定。
+        """
+        if getattr(self, "force_plan_mode", False):
+            return None
+        if not settings.get("rag.force_search_code", True):
+            return None
+        if not self._is_search_code_available():
+            return None
+
+        latest_index, query = self._latest_human_query(messages)
+        if latest_index < 0 or not query:
+            return None
+        if self._search_code_used_after(messages, latest_index):
+            return None
+        if not self._looks_like_codebase_question(query):
+            return None
+
+        tool_call_id = f"forced_searchcode_{int(time.time() * 1000)}"
+        logger.info("代码库问题强制首跳 SearchCode: %s", query[:120])
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "SearchCode",
+                "args": {"query": query, "top_k": 5},
+                "id": tool_call_id,
+            }],
+        )
+
+    def _is_search_code_available(self) -> bool:
+        """检查 SearchCode 是否已注册且本轮未被禁用。"""
+        if "SearchCode" in getattr(self, "_tool_unavailable_reasons", {}):
+            return False
+        if "SearchCode" in getattr(self, "_disabled_tools", {}):
+            return False
+        try:
+            return self.tool_registry.get("SearchCode") is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _latest_human_query(messages: list) -> tuple[int, str]:
+        """返回最近一条用户消息的位置和内容。"""
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if isinstance(msg, HumanMessage):
+                content = getattr(msg, "content", "")
+                return idx, content if isinstance(content, str) else str(content)
+        return -1, ""
+
+    @staticmethod
+    def _search_code_used_after(messages: list, index: int) -> bool:
+        """最近用户消息之后是否已经调用过 SearchCode。"""
+        for msg in messages[index + 1:]:
+            if isinstance(msg, AIMessage):
+                for tool_call in getattr(msg, "tool_calls", []) or []:
+                    if tool_call.get("name") == "SearchCode":
+                        return True
+            if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "SearchCode":
+                return True
+        return False
+
+    @staticmethod
+    def _looks_like_codebase_question(query: str) -> bool:
+        """启发式判断是否为本地代码库问题。"""
+        text = (query or "").lower()
+        if re.search(r"https?://", text):
+            return False
+
+        implementation_terms = (
+            "实现", "解释", "说明", "分析", "架构", "原理", "逻辑", "流程",
+            "调用", "入口", "模块", "源码", "代码", "类", "方法", "函数",
+            "在哪里", "在哪", "怎么", "如何",
+            "implement", "implementation", "explain", "architecture",
+            "flow", "logic", "code", "class", "method", "function",
+            "module", "where", "how",
+        )
+        codebase_cues = (
+            "weavemind", "这个项目", "本项目", "当前项目", "代码库", "源码",
+            "里面", "本地", "repo", "repository", "codebase",
+            "mcp", "mcp_client", "cli", "core", "rag", "tools",
+            "agents", "skills", "web", "permissions",
+        )
+        has_intent = any(term in text for term in implementation_terms)
+        has_codebase_cue = any(cue in text for cue in codebase_cues)
+        return has_intent and has_codebase_cue
+
     def _build_graph(self) -> StateGraph:
         """构建 LangGraph 状态图。"""
         graph = StateGraph(AgentState)
@@ -376,8 +469,9 @@ class AgentLoop:
                     messages = [system_msg] + list(messages)
 
         # Skill body 注入：drain buffer 并 prepend 到最新 user message
-        if self.skill_buffer and not self.skill_buffer.is_empty():
-            drained = self.skill_buffer.drain()
+        skill_buffer = getattr(self, "skill_buffer", None)
+        if skill_buffer and not skill_buffer.is_empty():
+            drained = skill_buffer.drain()
             if drained:
                 for i in range(len(messages) - 1, -1, -1):
                     if isinstance(messages[i], HumanMessage):
@@ -389,9 +483,14 @@ class AgentLoop:
         if self.compactor.should_compact(messages):
             messages = self.compactor.compact(messages)
 
+        forced_search = self._maybe_force_search_code(messages)
+        if forced_search:
+            return {"messages": [forced_search]}
+
         # 注入浏览器模式指令（强制 LLM 按工作流处理登录态问题）
-        if self.mcp_manager and self.mcp_manager._chrome_server_name:
-            mode = self.mcp_manager.get_chrome_mode()
+        mcp_manager = getattr(self, "mcp_manager", None)
+        if mcp_manager and mcp_manager._chrome_server_name:
+            mode = mcp_manager.get_chrome_mode()
             browser_hint = {
                 "isolated": (
                     "[浏览器操作指令] 当前为 isolated 模式（独立浏览器，无登录态）。\n"
@@ -450,7 +549,7 @@ class AgentLoop:
 
         # MiMo 模型禁用了 streaming（_stream 为空生成器），直接走 invoke 避免无效尝试
         from core.llm_factory import MiMoChatOpenAI
-        skip_stream = isinstance(self.llm, MiMoChatOpenAI)
+        skip_stream = isinstance(getattr(self, "llm", None), MiMoChatOpenAI)
 
         if not skip_stream:
             try:
