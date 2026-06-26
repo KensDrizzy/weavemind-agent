@@ -416,23 +416,40 @@ class CodeRAGPipeline:
     ) -> List[RetrievalResult]:
         """混合检索：语义 + 关键词 + 评分融合 + 同文件去重。
 
-        评分公式：
-        final_score = semantic_score * 0.5
-                    + keyword_score * 0.3
-                    + type_boost * 0.1
-                    + dual_hit_bonus * 0.1
+        融合策略（rag.retrieval.fusion 配置，默认 weighted）：
+        - weighted（默认，保持向后兼容）：
+            final = semantic*0.5 + keyword*0.3 + type_boost + dual_hit_bonus
+        - rrf（Reciprocal Rank Fusion，主流做法，无须分数归一化）：
+            score = Σ 1/(k+rank)，参考 OpenSearch/Elasticsearch/LangChain，k 默认 60
         """
         queries = query_variants or [query]
+        fusion = (settings.get("rag.retrieval.fusion", "weighted") or "weighted").lower()
 
         # 1. 分别召回候选集
         semantic_results = self._semantic_search_many(queries, top_k=top_k * 2, file_filter=file_filter, source_filter=source_filter)
         keyword_results = self._keyword_search_many(queries, top_k=top_k * 2, file_filter=file_filter, source_filter=source_filter)
 
-        # 2. 合并去重（以 file_path+name 为唯一键）
-        merged: dict = {}  # key -> RetrievalResult
+        if fusion == "rrf":
+            merged_values = self._rrf_fuse(semantic_results, keyword_results)
+        else:
+            merged_values = self._weighted_fuse(semantic_results, keyword_results)
 
+        sorted_results = sorted(merged_values, key=lambda x: -x.score)
+        return self._deduplicate_by_file(sorted_results, max_per_file=2)[:top_k]
+
+    @staticmethod
+    def _result_key(r: RetrievalResult) -> str:
+        return f"{r.chunk.file_path}::{r.chunk.name}::{r.chunk.start_line}"
+
+    def _weighted_fuse(
+        self,
+        semantic_results: List[RetrievalResult],
+        keyword_results: List[RetrievalResult],
+    ) -> List[RetrievalResult]:
+        """原有加权求和融合（默认，保持向后兼容）。"""
+        merged: dict = {}
         for r in semantic_results:
-            key = f"{r.chunk.file_path}::{r.chunk.name}::{r.chunk.start_line}"
+            key = self._result_key(r)
             if key in merged:
                 merged[key].keyword_score = max(merged[key].keyword_score, r.keyword_score)
                 merged[key].semantic_score = max(merged[key].semantic_score, r.semantic_score)
@@ -440,16 +457,14 @@ class CodeRAGPipeline:
                 merged[key] = r
 
         for r in keyword_results:
-            key = f"{r.chunk.file_path}::{r.chunk.name}::{r.chunk.start_line}"
+            key = self._result_key(r)
             if key in merged:
-                # 双重命中：语义+关键词都命中
                 merged[key].keyword_score = max(merged[key].keyword_score, r.keyword_score)
                 merged[key].semantic_score = max(merged[key].semantic_score, r.semantic_score)
                 merged[key].source = "hybrid"
             else:
                 merged[key] = r
 
-        # 3. 计算混合分数
         for r in merged.values():
             type_boost = {
                 "method": 0.08,
@@ -459,21 +474,62 @@ class CodeRAGPipeline:
                 "file": 0.0,
                 "block": 0.0,
             }.get(r.chunk.chunk_type, 0.0)
-
             dual_hit_bonus = 0.1 if (r.semantic_score > 0.3 and r.keyword_score > 0.1) else 0.0
-
             r.score = (
                 r.semantic_score * 0.5
                 + r.keyword_score * 0.3
                 + type_boost
                 + dual_hit_bonus
             )
+        return list(merged.values())
 
-        # 4. 排序
-        sorted_results = sorted(merged.values(), key=lambda x: -x.score)
+    def _rrf_fuse(
+        self,
+        semantic_results: List[RetrievalResult],
+        keyword_results: List[RetrievalResult],
+    ) -> List[RetrievalResult]:
+        """Reciprocal Rank Fusion：对每路结果按 rank 取 1/(k+rank) 求和。
 
-        # 5. 同文件去重（每个文件最多 2 条）
-        return self._deduplicate_by_file(sorted_results, max_per_file=2)[:top_k]
+        优点：不需要分数归一化，对 BM25/cosine 量纲差异天然鲁棒。
+        是 OpenSearch / Elasticsearch / Azure AI Search / LangChain EnsembleRetriever
+        的默认融合方式。这里在 RRF 主分数之上叠加少量类型/双命中加成，
+        保留对代码段（function/method）的偏好。
+        """
+        k = int(settings.get("rag.retrieval.rrf_k", 60))
+        merged: dict = {}
+
+        for rank, r in enumerate(semantic_results):
+            key = self._result_key(r)
+            entry = merged.get(key)
+            if entry is None:
+                merged[key] = r
+                entry = r
+                entry.score = 0.0
+            entry.semantic_score = max(entry.semantic_score, r.semantic_score)
+            entry.score += 1.0 / (k + rank + 1)
+
+        for rank, r in enumerate(keyword_results):
+            key = self._result_key(r)
+            entry = merged.get(key)
+            if entry is None:
+                merged[key] = r
+                entry = r
+                entry.score = 0.0
+            else:
+                entry.source = "hybrid"
+            entry.keyword_score = max(entry.keyword_score, r.keyword_score)
+            entry.score += 1.0 / (k + rank + 1)
+
+        for r in merged.values():
+            type_boost = {
+                "method": 0.005,
+                "function": 0.005,
+                "class": 0.003,
+            }.get(r.chunk.chunk_type, 0.0)
+            dual_hit_bonus = 0.005 if (r.semantic_score > 0 and r.keyword_score > 0) else 0.0
+            r.score += type_boost + dual_hit_bonus
+
+        return list(merged.values())
 
     @staticmethod
     def _merge_results(results: List[RetrievalResult]) -> List[RetrievalResult]:

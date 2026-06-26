@@ -12,6 +12,7 @@ from core.plan_models import Plan, Task, TaskStatus, PlanStatus
 from tools.registry import ToolRegistry
 from permissions.policy import PermissionPolicy
 from hooks.manager import HookManager
+from core.cancellation import AgentCancelledError, CancellationToken
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +35,13 @@ class PlanExecutor:
         permission_policy: PermissionPolicy,
         hook_manager: Optional[HookManager] = None,
         max_parallel: int = 4,
+        cancellation_token: Optional[CancellationToken] = None,
     ):
         self.tool_registry = tool_registry
         self.permission_policy = permission_policy
         self.hook_manager = hook_manager
         self.max_parallel = max_parallel
+        self.cancellation_token = cancellation_token
         # 兼容规划器生成的常见参数别名（如 file_path -> path）
         self.arg_aliases = {
             "path": {"file_path", "filepath", "file", "target_path"},
@@ -53,6 +56,7 @@ class PlanExecutor:
 
     def execute(self, plan: Plan) -> Plan:
         """同步执行计划（内部使用 asyncio 实现并行）。"""
+        self._check_cancelled()
         plan.status = PlanStatus.RUNNING
         logger.info(f"开始执行计划 {plan.id}: {plan.goal}")
 
@@ -70,6 +74,7 @@ class PlanExecutor:
     async def _execute_plan_async(self, plan: Plan):
         """异步并行执行计划。"""
         while not plan.is_finished():
+            self._check_cancelled()
             ready = plan.ready_tasks()
             if not ready:
                 # 无就绪任务但计划未结束 → 存在不可达任务
@@ -86,6 +91,7 @@ class PlanExecutor:
     def _execute_plan_serial(self, plan: Plan):
         """串行执行计划（回退方案）。"""
         while not plan.is_finished():
+            self._check_cancelled()
             ready = plan.ready_tasks()
             if not ready:
                 self._mark_unreachable(plan)
@@ -103,6 +109,7 @@ class PlanExecutor:
 
     def _execute_task(self, task: Task, plan: Plan):
         """执行单个任务：权限检查 → Hook → 工具调用 → Hook → 更新状态。"""
+        self._check_cancelled()
         task.mark_started()
         logger.info(f"执行任务 {task.id}: {task.description}")
 
@@ -149,6 +156,7 @@ class PlanExecutor:
                 })
 
             result = tool.invoke(tool_input)
+            self._check_cancelled()
 
             # PostToolUse Hook
             if self.hook_manager:
@@ -162,10 +170,17 @@ class PlanExecutor:
             task.mark_completed(result=str(result))
             logger.info(f"任务 {task.id} 完成")
 
+        except AgentCancelledError:
+            raise
         except Exception as e:
             logger.error(f"任务 {task.id} 执行失败: {e}")
             task.mark_failed(error=str(e))
             self._propagate_failure(task, plan)
+
+    def _check_cancelled(self):
+        token = getattr(self, "cancellation_token", None)
+        if token:
+            token.raise_if_cancelled()
 
     def _check_required_args(self, tool, tool_input: dict) -> list:
         """检查工具必填参数是否齐全，返回缺失的参数名列表。"""

@@ -1,6 +1,8 @@
 """Memory 系统测试。"""
 
-from core.memory import LongTermMemory
+import json
+
+from core.memory import LongTermMemory, MemoryEntry
 
 
 def test_long_term_memory_updates_highly_similar_fact(tmp_path):
@@ -32,3 +34,57 @@ def test_long_term_memory_keeps_distinct_fact(tmp_path):
     assert memory.store("项目使用 Chroma 做向量检索") is True
 
     assert len(memory.get_all()) == 2
+
+
+def test_search_bumps_access_count_and_persists(tmp_path):
+    """检索命中应递增 access_count、更新 last_access 并立即持久化。"""
+    path = str(tmp_path / "long_term.json")
+    memory = LongTermMemory(path)
+    memory.store("项目使用 Chroma 做向量检索")
+
+    results = memory.search("Chroma 向量")
+    assert len(results) == 1
+    assert results[0].access_count == 1
+    assert results[0].last_access > 0
+
+    # 落盘后，新实例应读到统计字段
+    reloaded = LongTermMemory(path)
+    entry = reloaded.get_all()[0]
+    assert entry.access_count == 1
+    assert entry.last_access > 0
+
+
+def test_legacy_entry_without_new_fields_loads(tmp_path):
+    """老版本数据没有 access_count/importance 字段时，应能正常加载并使用默认值。"""
+    path = tmp_path / "long_term.json"
+    legacy = [{
+        "id": "abc",
+        "content": "老格式条目",
+        "type": "fact",
+        "timestamp": 1700000000.0,
+        "token_count": 5,
+        "metadata": {},
+    }]
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    memory = LongTermMemory(str(path))
+    entries = memory.get_all()
+    assert len(entries) == 1
+    assert entries[0].access_count == 0
+    assert entries[0].importance == 1.0
+
+
+def test_importance_multiplier_boosts_ranking(tmp_path):
+    """高重要度条目应在检索时排在普通条目前面。"""
+    memory = LongTermMemory(str(tmp_path / "long_term.json"))
+    memory.store("普通的 Chroma 笔记")
+    memory.store("关键的 Chroma 决策")
+
+    # 把第二条手动标记为高重要度
+    entries = memory.get_all()
+    target = next(e for e in entries if "关键" in e.content)
+    target.importance = 3.0
+
+    results = memory.search("Chroma")
+    assert len(results) >= 2
+    assert "关键" in results[0].content

@@ -307,26 +307,50 @@ class MCPManager:
             logger.debug("已在 shared 模式，无需切换")
             return True
 
-        # 读取 DevToolsActivePort 文件
+        # 构建启动参数回退链，顺序对齐 chrome-devtools-mcp 官方推荐：
+        #   1) --browserUrl http://127.0.0.1:<port>   （官方首选，支持扩展程序）
+        #   2) --wsEndpoint ws://127.0.0.1:<port>...  （DevToolsActivePort 提供 WS 路径时的备用）
+        #   3) --autoConnect --userDataDir <dir>      （DevToolsActivePort 不在时）
+        #   4) 纯 --autoConnect                       （兜底）
+        # 任一步失败由 _restart_chrome_server 触发回滚后，外层会顺序尝试下一步。
         port_info = self._read_devtools_active_port()
+        attempts: list[tuple[str, list]] = []
+
         if port_info:
             port, ws_path = port_info
+            browser_url = f"http://127.0.0.1:{port}"
+            attempts.append((
+                f"browserUrl={browser_url}",
+                ["-y", "chrome-devtools-mcp@latest", "--browserUrl", browser_url],
+            ))
             ws_endpoint = f"ws://127.0.0.1:{port}{ws_path}"
-            logger.info("从 DevToolsActivePort 读取到 WebSocket: %s", ws_endpoint)
-            args = ["-y", "chrome-devtools-mcp@latest", "--wsEndpoint", ws_endpoint]
-        else:
-            # DevToolsActivePort 不存在，尝试用 --autoConnect + --userDataDir
-            user_data_dir = self._get_chrome_user_data_dir()
-            if user_data_dir:
-                logger.info("DevToolsActivePort 不存在，尝试 autoConnect + userDataDir: %s", user_data_dir)
-                args = ["-y", "chrome-devtools-mcp@latest", "--autoConnect", "--userDataDir", user_data_dir]
-            else:
-                # 最后回退到纯 autoConnect
-                logger.info("尝试纯 autoConnect 模式...")
-                args = self.SHARED_AUTOCONNECT_ARGS
+            attempts.append((
+                f"wsEndpoint={ws_endpoint}",
+                ["-y", "chrome-devtools-mcp@latest", "--wsEndpoint", ws_endpoint],
+            ))
 
-        logger.info("正在切换 Chrome DevTools MCP Server 到 shared 模式...")
-        return await self._restart_chrome_server(args, "shared")
+        user_data_dir = self._get_chrome_user_data_dir()
+        if user_data_dir:
+            attempts.append((
+                f"autoConnect+userDataDir={user_data_dir}",
+                ["-y", "chrome-devtools-mcp@latest", "--autoConnect", "--userDataDir", user_data_dir],
+            ))
+
+        attempts.append(("autoConnect", list(self.SHARED_AUTOCONNECT_ARGS)))
+
+        logger.info("正在切换 Chrome DevTools MCP Server 到 shared 模式，回退链共 %d 级", len(attempts))
+        last_error = None
+        for label, args in attempts:
+            logger.info("尝试 shared 连接方式：%s", label)
+            ok = await self._restart_chrome_server(args, "shared")
+            if ok:
+                logger.info("shared 模式接入成功（方式：%s）", label)
+                return True
+            last_error = self._last_restart_error
+
+        if last_error:
+            logger.error("所有 shared 接入方式均失败，最后一次错误: %s", last_error)
+        return False
 
     async def switch_to_isolated(self) -> bool:
         """切换回 isolated 模式（独立浏览器，无登录态）。

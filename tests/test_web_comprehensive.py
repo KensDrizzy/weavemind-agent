@@ -227,7 +227,8 @@ class TestWebFetcherEdgeCases:
 
         fetcher = WebFetcher()
         result = fetcher.fetch("https://spa.example.com")
-        assert "未提取到正文" in result["content"]
+        # 实现已升级文案，统一对外提示用户走 WebSearch（避免 Agent 死循环重试 WebFetch）
+        assert "无法提取" in result["content"] or "未提取到正文" in result["content"]
 
 
 # ── SearchProviderFactory 边界测试 ──
@@ -241,11 +242,16 @@ class TestSearchProviderFactoryEdgeCases:
         SearchProviderFactory.reset()
 
     def test_auto_fallback_to_duckduckgo(self):
-        """无 Tavily/SearXNG 时应回退到 DuckDuckGo。"""
+        """无 Tavily/SearXNG 时应回退到 DuckDuckGo。
+
+        必须同时清空 env 和 settings：config.yaml 可能存在 tavily/serpapi key，
+        否则自动检测会优先命中已配置的 Provider，无法走到 ddgs 回退分支。
+        """
         with patch.dict("os.environ", {}, clear=True):
-            provider = SearchProviderFactory.create("auto")
-            # DuckDuckGo 已安装，应被选中
-            assert provider.name() == "duckduckgo"
+            with patch("settings.get", side_effect=lambda key, default=None: default):
+                provider = SearchProviderFactory.create("auto")
+                # DuckDuckGo 已安装（ddgs 包），应被选中
+                assert provider.name() == "duckduckgo"
 
     def test_explicit_overrides_env(self):
         """显式指定应覆盖环境变量。"""

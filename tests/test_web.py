@@ -51,12 +51,15 @@ class TestTavilyProvider:
         assert TavilyProvider().name() == "tavily"
 
     def test_not_ready_without_key(self):
+        # 必须同时清空 env 和 config.yaml，避免 config.yaml 残留 key 干扰
         with patch.dict("os.environ", {}, clear=True):
-            assert TavilyProvider().is_ready() is False
+            with patch("settings.get", return_value=""):
+                assert TavilyProvider().is_ready() is False
 
     def test_ready_with_key(self):
         with patch.dict("os.environ", {"TAVILY_API_KEY": "test-key"}):
-            assert TavilyProvider().is_ready() is True
+            with patch("settings.get", return_value=""):
+                assert TavilyProvider().is_ready() is True
 
     def test_unavailable_hint(self):
         hint = TavilyProvider().unavailable_hint()
@@ -193,11 +196,13 @@ class TestSerpApiProvider:
 
     def test_not_ready_without_key(self):
         with patch.dict("os.environ", {}, clear=True):
-            assert SerpApiProvider().is_ready() is False
+            with patch("settings.get", return_value=""):
+                assert SerpApiProvider().is_ready() is False
 
     def test_ready_with_key(self):
         with patch.dict("os.environ", {"SERPAPI_KEY": "test-key"}):
-            assert SerpApiProvider().is_ready() is True
+            with patch("settings.get", return_value=""):
+                assert SerpApiProvider().is_ready() is True
 
     def test_unavailable_hint(self):
         hint = SerpApiProvider().unavailable_hint()
@@ -254,7 +259,8 @@ class TestDuckDuckGoProvider:
 
     def test_unavailable_hint(self):
         hint = DuckDuckGoProvider().unavailable_hint()
-        assert "duckduckgo-search" in hint
+        # 实现已切换到 ddgs 包（duckduckgo-search 的新名）
+        assert "ddgs" in hint
 
     def test_search_success(self):
         mock_ddgs = MagicMock()
@@ -264,7 +270,7 @@ class TestDuckDuckGoProvider:
             {"title": "Go", "href": "https://go.dev", "body": "Go官网"},
         ]
 
-        with patch("duckduckgo_search.DDGS", return_value=mock_ddgs):
+        with patch("ddgs.DDGS", return_value=mock_ddgs):
             results = DuckDuckGoProvider().search("Go")
         assert len(results) == 1
         assert results[0].title == "Go"
@@ -276,7 +282,7 @@ class TestDuckDuckGoProvider:
         mock_ddgs.__exit__ = MagicMock(return_value=False)
         mock_ddgs.text.side_effect = Exception("Rate limited")
 
-        with patch("duckduckgo_search.DDGS", return_value=mock_ddgs):
+        with patch("ddgs.DDGS", return_value=mock_ddgs):
             with pytest.raises(RuntimeError, match="DuckDuckGo 搜索失败"):
                 DuckDuckGoProvider().search("Go")
 

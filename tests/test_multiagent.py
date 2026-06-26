@@ -410,6 +410,7 @@ class TestClassifyComplexity:
 
     def test_uses_configured_provider(self):
         """验证复杂度判断使用 config.yaml 中配置的 classifier 模型。"""
+        import settings
         loop = self._make_agent_loop("simple")
         with patch("core.llm_factory.create_llm") as mock_create:
             mock_resp = MagicMock()
@@ -417,7 +418,10 @@ class TestClassifyComplexity:
             mock_create.return_value.invoke.return_value = mock_resp
             loop.classify_complexity("测试任务")
             # 应使用 config.yaml 中 team.classifier_provider/model 配置
-            mock_create.assert_called_once_with(provider="mimo", model="mimo-v2.5-pro")
+            # 不硬编码具体 provider/model，避免随配置漂移；只校验"读了配置"
+            expected_provider = settings.get("team.classifier_provider", loop.provider)
+            expected_model = settings.get("team.classifier_model", loop.model)
+            mock_create.assert_called_once_with(provider=expected_provider, model=expected_model)
 
 
 class TestShouldAutoTeam:

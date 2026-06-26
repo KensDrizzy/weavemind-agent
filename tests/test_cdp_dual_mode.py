@@ -195,8 +195,15 @@ class TestPermissionPolicyChrome:
         needs, msg = policy.needs_chrome_confirmation("click", "https://www.alipay.com/pay")
         assert needs is True
 
-    def test_browser_connect_needs_confirmation(self):
+    def test_browser_connect_does_not_block_automation(self):
+        """browser_connect 已从 BROWSER_CONNECT_TOOLS 移除，允许 Agent 自主切换浏览器模式。
+
+        当前策略：browser_disconnect 才需要确认（避免误断登录态会话），
+        browser_connect 视为可自动化的初始化动作。
+        """
         from permissions.policy import PermissionPolicy, BROWSER_CONNECT_TOOLS
         policy = PermissionPolicy()
-        assert "browser_connect" in BROWSER_CONNECT_TOOLS
-        assert policy.needs_confirmation("browser_connect", "default") is True
+        assert "browser_connect" not in BROWSER_CONNECT_TOOLS
+        assert "browser_disconnect" in BROWSER_CONNECT_TOOLS
+        assert policy.needs_confirmation("browser_connect", "default") is False
+        assert policy.needs_confirmation("browser_disconnect", "default") is True

@@ -17,6 +17,7 @@ from typing import Literal, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
+from pydantic import BaseModel, Field
 
 from agents.agent_state import MultiAgentState
 from agents.worker import create_worker_node
@@ -68,13 +69,32 @@ PLANNER_SYSTEM_PROMPT = (
 )
 
 
+def _build_router_model(options: list[str]):
+    """根据 options 动态构造 Pydantic Router，约束 LLM 只能返回这些值。
+
+    对标 LangGraph 官方 supervisor 教程的结构化输出做法：
+    使用 Literal 把可选路由烧到 schema 里，让 provider 端的 JSON schema 校验
+    或函数调用约束帮我们把"幻觉路由"拒在外面。
+    """
+    literal_type = Literal[tuple(options)]  # type: ignore[valid-type]
+
+    class _Router(BaseModel):
+        """Supervisor 路由决策。"""
+        next: literal_type = Field(  # type: ignore[valid-type]
+            description="下一个执行的成员，或 FINISH 表示任务完成"
+        )
+
+    return _Router
+
+
 def make_supervisor_node(llm, members: list[str]):
     """创建 Supervisor 节点：LLM 路由决策。
 
-    策略（三层回退）：
-    1. 尝试从 LLM 回复中提取 JSON，兼容多种字段名
-    2. 从纯文本中提取路由目标（关键词匹配）
-    3. 以上都失败 → FINISH
+    策略（四层回退，优先级从高到低）：
+    1. 硬性规则：基于已工作 Agent 直接路由（最稳，无 LLM）
+    2. 结构化输出：llm.with_structured_output(Router) — 对标 LangGraph 官方做法
+    3. JSON 提取：从 LLM 文本中提取 JSON 对象，兼容多种字段名
+    4. 纯文本关键词匹配 → 仍失败则 FINISH
 
     Args:
         llm: LangChain LLM 实例
@@ -84,6 +104,14 @@ def make_supervisor_node(llm, members: list[str]):
         supervisor_node: 可添加到 StateGraph 的节点函数
     """
     options = ["FINISH"] + members
+
+    # 预构造结构化输出版本的 LLM；个别 provider 不支持时在调用处兜底
+    try:
+        _router_model = _build_router_model(options)
+        _structured_llm = llm.with_structured_output(_router_model)
+    except Exception as e:  # pragma: no cover - 仅 provider 不支持时触发
+        logger.debug(f"Supervisor 结构化路由不可用，回退文本解析: {e}")
+        _structured_llm = None
 
     system_prompt = SUPERVISOR_SYSTEM_PROMPT
 
@@ -203,15 +231,28 @@ def make_supervisor_node(llm, members: list[str]):
             goto = force_route
             logger.info(f"Supervisor 硬性路由: {goto}（基于已工作 Agent 状态）")
         else:
-            # 调用 LLM 获取路由决策
-            try:
-                response = llm.invoke(messages)
-                response_text = response.content or ""
-                goto = _extract_route(response_text)
-                logger.info(f"Supervisor LLM 回复: {response_text[:150]}, 提取路由: {goto}")
-            except Exception as e:
-                logger.error(f"Supervisor LLM 调用失败: {e}")
-                goto = "FINISH"
+            goto = None
+            # ① 优先走结构化输出（对标 LangGraph 官方 supervisor 教程的稳定路径）
+            if _structured_llm is not None:
+                try:
+                    decision = _structured_llm.invoke(messages)
+                    candidate = getattr(decision, "next", None)
+                    if isinstance(candidate, str) and candidate in options:
+                        goto = candidate
+                        logger.info(f"Supervisor 结构化路由: {goto}")
+                except Exception as e:
+                    logger.debug(f"Supervisor 结构化输出失败，退回文本解析: {e}")
+
+            # ② 兜底：保留原有 JSON + 关键词解析路径，确保对不支持 schema 的 provider 仍可用
+            if goto is None:
+                try:
+                    response = llm.invoke(messages)
+                    response_text = response.content or ""
+                    goto = _extract_route(response_text)
+                    logger.info(f"Supervisor 文本路由: {response_text[:150]}, 提取: {goto}")
+                except Exception as e:
+                    logger.error(f"Supervisor LLM 调用失败: {e}")
+                    goto = "FINISH"
 
         if goto == "FINISH":
             return Command(goto=END, update={"next": "__end__"})

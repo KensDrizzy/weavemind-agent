@@ -51,6 +51,12 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    # 微信通道是独立入口，必须在终端 CLI/MCP 初始化前分流。
+    if len(sys.argv) > 1 and sys.argv[1] == "wechat":
+        from channels.wechat.cli import main as wechat_main
+
+        raise SystemExit(wechat_main(sys.argv[2:]))
+
     # 静默 MCP 断开连接时的 cancel scope 跨 task 警告
     logging.getLogger("mcp_client.client").addFilter(
         _McpCancelScopeFilter()

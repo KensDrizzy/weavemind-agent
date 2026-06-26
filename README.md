@@ -46,6 +46,24 @@ python main.py --debug     # 启用调试日志
 python main.py --no-hitl   # 禁用人工审批
 ```
 
+## 微信接入
+
+WeaveMindAgent 可以通过腾讯 iLink Bot API 在微信私聊中运行。微信通道是独立入口，默认不会启动，也不会改变现有终端 CLI。
+
+```bash
+# 首次绑定：终端显示二维码，使用微信扫码确认
+weavemind wechat setup --workspace /path/to/project
+
+# 前台启动微信通道
+weavemind wechat start
+
+# 查看状态或删除本地凭证
+weavemind wechat status
+weavemind wechat logout
+```
+
+首版采用 `remote_safe` 只读策略：仅开放工作区内的 Read / Glob / Grep、代码 RAG 和联网检索，不开放 Write、Edit、Bash、浏览器修改及外部 MCP 写操作。微信凭证保存在 `~/.weavemind/wechat/account.json`，文件权限为 `0600`。
+
 ## 配置
 
 配置文件默认读取 `config.yaml`。可以从 `config.yaml.example` 复制后修改。

@@ -4,8 +4,9 @@
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CALLER_CWD="$PWD"
 
 # Activate virtual environment and run main.py
 source "$SCRIPT_DIR/.venv/bin/activate"
 cd "$SCRIPT_DIR"
-python main.py
+WEAVEMIND_CALLER_CWD="$CALLER_CWD" python main.py "$@"

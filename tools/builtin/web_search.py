@@ -99,3 +99,7 @@ class WebSearchTool(WeaveMindTool):
             formatted.append(f"[{i}. {r.get('title', '')}]({r.get('url', '')})\n{r.get('content', '')}")
 
         return "\n\n---\n\n".join(formatted)
+
+
+# 模块级实例别名：保留对历史 `from tools.builtin.web_search import WebSearch` 用法的兼容。
+WebSearch = WebSearchTool()

@@ -59,6 +59,8 @@ rag:
     strategy: hybrid
     top_k: 10
     max_per_file: 2
+    fusion: weighted          # weighted（默认，加权求和）| rrf（Reciprocal Rank Fusion，无须分数归一化）
+    rrf_k: 60                 # 仅 fusion=rrf 时生效；OpenSearch/LangChain 默认值
   query_rewrite:
     enabled: true
     method: rules          # rules | llm | auto
@@ -79,3 +81,29 @@ rag:
     enabled: true
     ttl_seconds: 300
     max_entries: 128
+
+# 微信 iLink 通道（独立运行：weavemind wechat setup/start）
+wechat:
+  api_base_url: https://ilinkai.weixin.qq.com
+  app_id: bot
+  route_tag:
+  account_file: ~/.weavemind/wechat/account.json
+  login_timeout_seconds: 480
+  poll_timeout_seconds: 35
+  busy_poll_timeout_seconds: 3
+  typing_refresh_seconds: 5
+  queue_max_size: 20
+  max_reply_chars: 3800
+  max_conversation_messages: 40
+  private_chat_only: true
+  security:
+    # 远程入口固定为失败关闭；这里只能从内置只读集合中做减法。
+    allowed_tools:
+      - Read
+      - Glob
+      - Grep
+      - SearchCode
+      - WebSearch
+      - WebFetch
+      - MemorySearch
+      - load_skill

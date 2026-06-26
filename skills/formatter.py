@@ -1,7 +1,9 @@
 """SkillIndexFormatter — 格式化 Skill 索引给 LLM 看。"""
 from skills.models import Skill
 
-MAX_DESC_LEN = 500
+# 索引中 description 的截断长度。Anthropic Skills 规范允许 description 最长 1024 字符；
+# 这里取 600 作为权衡：常规简介足够展开，又能压住 system prompt 长度。
+MAX_DESC_LEN = 600
 MAX_INDEX_SKILLS = 20
 
 

@@ -89,3 +89,7 @@ class WebFetchTool(WeaveMindTool):
         text = re.sub(r"<[^>]+>", " ", resp.text)
         text = re.sub(r"\s+", " ", text).strip()
         return text[:max_chars]
+
+
+# 模块级实例别名：保留对历史 `from tools.builtin.web_fetch import WebFetch` 用法的兼容。
+WebFetch = WebFetchTool()

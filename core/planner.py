@@ -122,14 +122,14 @@ class Planner:
         json_str = self._extract_json(raw_content)
         plan_data = json.loads(json_str)
 
-        # 构建并验证 Plan 对象
+        # 构建并验证 Plan 对象  Pydantic 逐个校验 Task
         tasks = [Task(**t) for t in plan_data.get("tasks", [])]
         plan = Plan(
             goal=plan_data.get("goal", goal),
             tasks=tasks,
         )
 
-        # 验证 DAG 无循环依赖
+        # 验证 DAG 无循环依赖  DFS 检测循环依赖
         self._validate_dag(plan)
 
         logger.info(f"计划生成完成: {plan.id}, 共 {len(plan.tasks)} 个任务")

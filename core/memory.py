@@ -21,6 +21,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -38,7 +39,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MemoryEntry:
-    """记忆条目 — 记忆系统的基本单元。"""
+    """记忆条目 — 记忆系统的基本单元。
+
+    访问统计字段（access_count / last_access）对标 Letta archival memory：
+    高频被检索的记忆获得排名奖励，避免"重要但旧"被时间衰减压沉。
+    importance 是可选乘子，留给上层（如 CoreMemory 提升、用户标注 pin）使用。
+    """
 
     id: str
     content: str
@@ -46,13 +52,19 @@ class MemoryEntry:
     timestamp: float
     token_count: int
     metadata: dict = field(default_factory=dict)
+    access_count: int = 0
+    last_access: float = 0.0
+    importance: float = 1.0
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "MemoryEntry":
-        return cls(**d)
+        # 老格式向后兼容：磁盘上可能没有新字段，用默认值补齐
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in d.items() if k in known}
+        return cls(**filtered)
 
 
 # ── 长期记忆 ─────────────────────────────────────────────
@@ -186,12 +198,17 @@ class LongTermMemory:
         return best
 
     def search(self, query: str, limit: int = 5) -> list[MemoryEntry]:
-        """检索相关记忆 — 子串匹配 + 字符 bigram 相似度 + 时间衰减。"""
+        """检索相关记忆 — 子串匹配 + 字符 bigram 相似度 + 时间衰减 + 使用频次。
+
+        参考 Letta archival memory：召回时回写访问统计，
+        让"被频繁使用的记忆"获得排名奖励，命中后立即持久化。
+        """
         if not query or not self._entries:
             return []
 
         query_lower = query.lower().strip()
         scored: list[tuple[float, MemoryEntry]] = []
+        now = time.time()
 
         for entry in self._entries.values():
             content_lower = entry.content.lower()
@@ -205,15 +222,40 @@ class LongTermMemory:
             score += self._bigram_similarity(query_lower, content_lower)
 
             # 时间衰减（7 天半衰期）
-            age_hours = (time.time() - entry.timestamp) / 3600
+            age_hours = (now - entry.timestamp) / 3600
             decay = 0.5 ** (age_hours / 168)  # 168h = 7 days
             score *= 0.3 + 0.7 * decay  # 最低保留 30% 权重
+
+            # 使用频次奖励（对数饱和，避免被高频条目垄断）
+            if entry.access_count > 0:
+                score += 0.15 * math.log1p(entry.access_count)
+
+            # 最近使用奖励（1 天半衰期，最多 +0.3）
+            if entry.last_access > 0:
+                recent_hours = (now - entry.last_access) / 3600
+                score += 0.3 * (0.5 ** (recent_hours / 24))
+
+            # 重要度乘子（默认 1.0；用户/系统标记 pin 时上调）
+            score *= entry.importance
 
             if score > 0.1:
                 scored.append((score, entry))
 
         scored.sort(key=lambda x: -x[0])
-        return [e for _, e in scored[:limit]]
+        top = [e for _, e in scored[:limit]]
+
+        # 命中即写：回写访问统计，让"用过"的记忆下次更易召回
+        if top:
+            for entry in top:
+                entry.access_count += 1
+                entry.last_access = now
+            try:
+                self._save()
+            except Exception as e:
+                # 写盘失败不影响检索结果返回
+                logger.debug(f"长期记忆访问统计回写失败（忽略）: {e}")
+
+        return top
 
     @staticmethod
     def _bigram_similarity(a: str, b: str) -> float:

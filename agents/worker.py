@@ -8,8 +8,24 @@ import logging
 from typing import Literal
 
 from langchain_core.messages import HumanMessage
-from langgraph.prebuilt import create_react_agent
 from langgraph.types import Command
+
+# LangGraph V1 起，create_react_agent 迁移到 langchain.agents.create_agent，
+# 参数 prompt → system_prompt。这里做版本兼容：优先用新 API，回退到老 API。
+try:
+    from langchain.agents import create_agent as _create_agent  # type: ignore
+
+    def _make_react_agent(llm, tools, system_prompt):
+        return _create_agent(llm, tools, system_prompt=system_prompt)
+
+    _USING_NEW_AGENT_API = True
+except ImportError:  # pragma: no cover - 老版本环境的回退路径
+    from langgraph.prebuilt import create_react_agent as _legacy_create  # type: ignore
+
+    def _make_react_agent(llm, tools, system_prompt):
+        return _legacy_create(llm, tools=tools, prompt=system_prompt)
+
+    _USING_NEW_AGENT_API = False
 
 from agents.agent_state import MultiAgentState
 
@@ -66,8 +82,9 @@ def create_worker_node(
         # 加载全部工具
         tools = tool_registry.get_langchain_tools()
 
-    # 用 create_react_agent 创建完整的 ReAct Agent
-    agent = create_react_agent(llm, tools=tools, prompt=prompt)
+    # 用 LangChain create_agent（V1 推荐）/ langgraph.prebuilt（旧版本兜底）创建完整 ReAct Agent
+    agent = _make_react_agent(llm, tools, system_prompt=prompt)
+    logger.debug(f"Worker {name}: 使用 {'langchain.agents.create_agent' if _USING_NEW_AGENT_API else 'langgraph.prebuilt.create_react_agent'}")
 
     def worker_node(state: MultiAgentState) -> Command[Literal["supervisor"]]:
         """Worker 执行节点：调用 ReAct Agent 处理任务。"""

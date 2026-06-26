@@ -27,6 +27,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
 from core.compaction import ContextCompactor
+from core.cancellation import AgentCancelledError, CancellationToken
 from core.llm_factory import create_llm
 from core.memory import MemoryManager
 from core.plan_models import Plan
@@ -75,6 +76,7 @@ class AgentLoop:
         mcp_manager=None,
         skill_registry=None,
         skill_buffer=None,
+        cancellation_token: Optional[CancellationToken] = None,
     ):
         self.tool_registry = tool_registry
         self.permission_policy = permission_policy
@@ -86,6 +88,7 @@ class AgentLoop:
         self.mcp_manager = mcp_manager
         self.skill_registry = skill_registry
         self.skill_buffer = skill_buffer
+        self.cancellation_token = cancellation_token
         self.mode = "default"
         self._model_call_count = 0
         self._tool_unavailable_reasons: dict[str, str] = {}
@@ -104,9 +107,16 @@ class AgentLoop:
             tool_registry=tool_registry,
             permission_policy=permission_policy,
             hook_manager=hook_manager,
+            cancellation_token=cancellation_token,
         )
 
         self.graph = self._build_graph()
+
+    def _check_cancelled(self):
+        """Stop at safe orchestration boundaries when a channel cancels."""
+        token = getattr(self, "cancellation_token", None)
+        if token:
+            token.raise_if_cancelled()
 
     def _filter_available_tools(self, tools: list) -> list:
         """过滤当前环境不可用的工具，避免模型反复调用失败工具。"""
@@ -442,6 +452,7 @@ class AgentLoop:
 
     def _think(self, state: AgentState) -> dict:
         """调用 LLM 思考，决定下一步行动。"""
+        self._check_cancelled()
         messages = state["messages"]
 
         # 首次调用时注入系统提示（每次重新构建，包含最新记忆和检索结果）
@@ -554,6 +565,7 @@ class AgentLoop:
         if not skip_stream:
             try:
                 for chunk in self.llm_with_tools.stream(messages):
+                    self._check_cancelled()
                     full_chunk = chunk if full_chunk is None else full_chunk + chunk
                     delta_text = self._extract_text_content(getattr(chunk, "content", ""))
                     if delta_text and self.hook_manager:
@@ -563,11 +575,14 @@ class AgentLoop:
                             "call_index": call_index,
                             "delta": delta_text,
                         })
+            except AgentCancelledError:
+                raise
             except Exception as e:
                 stream_failed = True
                 logger.debug(f"LLM stream 失败，回退 invoke: {e}")
 
         if full_chunk is None or stream_failed:
+            self._check_cancelled()
             response = self.llm_with_tools.invoke(messages)
             if self.hook_manager and not emitted_any_delta:
                 response_text = self._extract_text_content(getattr(response, "content", ""))
@@ -578,6 +593,8 @@ class AgentLoop:
                     })
         else:
             response = message_chunk_to_message(full_chunk)
+
+        self._check_cancelled()
 
         # MiMo reasoning_content 捕获：保存 thinking 内容以便后续回传
         self._preserve_reasoning_content(response)
@@ -789,6 +806,7 @@ class AgentLoop:
 
     def _act(self, state: AgentState) -> dict:
         """执行工具调用。"""
+        self._check_cancelled()
         last_message = state["messages"][-1]
         if not isinstance(last_message, AIMessage):
             return {}
@@ -796,6 +814,7 @@ class AgentLoop:
         from langchain_core.messages import ToolMessage
         tool_messages = []
         for tool_call in last_message.tool_calls:
+            self._check_cancelled()
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
 
@@ -968,8 +987,12 @@ class AgentLoop:
             tool = self.tool_registry.get(tool_name)
             if tool:
                 try:
+                    self._check_cancelled()
                     result = tool.invoke(tool_args)
+                    self._check_cancelled()
                     self._tool_failure_counts[tool_name] = 0
+                except AgentCancelledError:
+                    raise
                 except Exception as e:
                     had_error = True
                     self._record_tool_failure(tool_name, str(e))
@@ -1038,6 +1061,7 @@ class AgentLoop:
 
         如果 LLM 已给出 tool_calls，直接用它们构建计划，避免 Planner 重新生成时丢失参数。
         """
+        self._check_cancelled()
         user_messages = [
             m for m in state["messages"] if isinstance(m, HumanMessage)
         ]
@@ -1091,6 +1115,7 @@ class AgentLoop:
 
     def _execute_plan(self, state: AgentState) -> dict:
         """执行已生成的计划。"""
+        self._check_cancelled()
         plan_dict = state.get("plan")
         if not plan_dict:
             return {"messages": [AIMessage(content="无可执行的计划")]}
@@ -1129,6 +1154,7 @@ class AgentLoop:
     def stream(self, user_input: str):
         """流式执行 Agent 循环，yield 每步状态。"""
         self._reset_runtime_state()
+        self._check_cancelled()
         initial_state = {
             "messages": [HumanMessage(content=user_input)],
             "plan": None,
@@ -1136,11 +1162,13 @@ class AgentLoop:
 
         config = {"recursion_limit": 100}
         for event in self.graph.stream(initial_state, config=config):
+            self._check_cancelled()
             yield event
 
     def stream_with_history(self, conversation: list):
         """流式执行 Agent 循环，传入完整对话历史。"""
         self._reset_runtime_state()
+        self._check_cancelled()
 
         # 压缩检查（对话历史过长时自动压缩）
         if self.compactor.should_compact(conversation):
@@ -1153,11 +1181,13 @@ class AgentLoop:
 
         config = {"recursion_limit": 100}
         for event in self.graph.stream(initial_state, config=config):
+            self._check_cancelled()
             yield event
 
     def invoke(self, user_input: str) -> dict:
         """同步执行 Agent 循环，返回最终状态。"""
         self._reset_runtime_state()
+        self._check_cancelled()
         initial_state = {
             "messages": [HumanMessage(content=user_input)],
             "plan": None,
