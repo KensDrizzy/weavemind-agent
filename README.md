@@ -16,12 +16,14 @@ WeaveMindAgent 是一个面向代码工作的终端 Agent CLI。它基于 LangGr
 - MCP / 浏览器：可连接多个 MCP Server，并支持 Chrome DevTools isolated/shared 双模式。
 - HITL 审批：危险文件操作、Shell、浏览器写操作和外部 MCP 工具可在执行前请求人工确认。
 - Skill 系统：按任务场景加载可复用经验指引，支持 builtin / user / project 三层覆盖。
+- 微信通道：可通过腾讯 iLink Bot API 将 Agent 接入微信私聊，并以远程只读安全策略运行。
+- 会话运行时：支持独立 Agent Session、协作取消信号和运行结果封装，便于 CLI 与远程入口复用。
 
 ## 快速开始
 
 ```bash
-git clone <repo-url>
-cd WeaveMindAgent
+git clone git@github.com:KensDrizzy/weavemind-agent.git
+cd weavemind-agent
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -72,12 +74,15 @@ weavemind wechat logout
 
 ```yaml
 llm:
-  provider: mimo
-  model: mimo-v2.5-pro
+  provider: anthropic
+  model: claude-sonnet-4-20250514
   max_tokens: 8192
   temperature: 0
 
 providers:
+  anthropic:
+    api_key_env: ANTHROPIC_API_KEY
+
   mimo:
     base_url: https://token-plan-cn.xiaomimimo.com/anthropic
     api_key_env: MIMO_API_KEY
@@ -92,9 +97,20 @@ rag:
 
 team:
   auto_detect: true
+
+wechat:
+  private_chat_only: true
+  security:
+    allowed_tools:
+      - Read
+      - Glob
+      - Grep
+      - SearchCode
+      - WebSearch
+      - WebFetch
 ```
 
-LLM 支持 `anthropic`、`deepseek`、`mimo`、`openai`。其中 MiMo、DeepSeek、OpenAI 走 OpenAI 兼容接口；Anthropic 走原生接口。API Key 通常通过环境变量提供，例如：
+LLM 支持 `anthropic`、`deepseek`、`mimo`、`openai`。Anthropic 走原生接口；MiMo、DeepSeek 和 OpenAI 兼容服务可通过对应 `base_url` 接入。API Key 通常通过环境变量提供，例如：
 
 ```bash
 export MIMO_API_KEY=...
@@ -168,6 +184,8 @@ think -> route -> plan_or_react -> act -> think -> ... -> END
 Agent 核心能力层。
 
 - `agent_loop.py`：LangGraph 状态机，负责 ReAct 循环、工具执行、权限检查、HITL、浏览器循环检测、RAG 上下文注入、上下文压缩和 Multi-Agent 入口。
+- `agent_session.py`：可复用的单次 Agent 会话运行器，封装运行结果、错误和取消状态，供 CLI 与微信通道共享。
+- `cancellation.py`：轻量级取消令牌，用于跨入口协作停止长任务。
 - `llm_factory.py`：根据配置创建 LLM；支持 OpenAI 兼容接口、Anthropic 原生接口，并为 MiMo thinking 模式保留 `reasoning_content`。
 - `memory.py`：记忆门面，组合 CLAUDE.md、MEMORY.md、核心记忆、长期记忆和 Skill 索引生成 system prompt。
 - `compaction.py`：上下文压缩器，超过 token 阈值时保留最近轮次，旧消息用摘要替换，并抽取关键事实写入长期记忆。
@@ -248,6 +266,17 @@ Chrome DevTools 支持两种模式：
 - `isolated`：MCP 启动独立浏览器，无用户登录态。
 - `shared`：连接用户已登录 Chrome，可访问需要登录的页面，敏感操作需要确认。
 
+### `channels/`
+
+远程入口模块。当前包含微信 iLink 通道：
+
+- `wechat/cli.py`：实现 `weavemind wechat setup/start/status/logout`。
+- `wechat/engine.py`：轮询消息、调度 Agent Session、处理忙碌状态和回复截断。
+- `wechat/ilink_client.py`：封装登录、轮询、发送消息和 typing 状态。
+- `wechat/account_store.py`：以 `0600` 权限保存本地微信凭证。
+- `wechat/safety.py`：远程入口只读工具白名单和请求过滤。
+- `wechat/message_parser.py` / `renderer.py` / `models.py`：消息解析、回复渲染和数据模型。
+
 ### `skills/`
 
 经验复用系统。
@@ -297,12 +326,13 @@ Chrome DevTools 支持两种模式：
 | `.weavemind/skills/` | 项目级 Skills |
 | `.weavemind/prompts/` | 项目级提示词覆盖 |
 | `.weavemind/chrome_screenshots/` | Chrome 截图缓存 |
+| `~/.weavemind/wechat/account.json` | 微信 iLink 本地登录凭证 |
 
 ## 开发与测试
 
 ```bash
 source .venv/bin/activate
-pytest
+python -m pytest
 ```
 
 常用单测：
@@ -331,6 +361,7 @@ WeaveMindAgent/
 ├── main.py                 # CLI 入口
 ├── cli/                    # 终端交互、命令、渲染、HITL
 ├── core/                   # AgentLoop、LLM、记忆、计划执行、提示词
+├── channels/               # 微信等远程入口
 ├── tools/                  # 内置工具、RAG 工具、HITL 工具注册表
 ├── permissions/            # 权限模式和策略
 ├── rag/                    # 代码索引和混合检索
