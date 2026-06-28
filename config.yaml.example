@@ -39,6 +39,15 @@ team:
   classifier_provider: deepseek
   classifier_model: deepseek-v4-pro
 
+delegation:
+  max_concurrent_children: 3
+  child_timeout_seconds: 600
+  max_result_chars: 8000
+  subagent_auto_approve: false
+  heartbeat_interval_seconds: 30
+  stale_cycles_idle: 15
+  stale_cycles_in_tool: 40
+
 tools:
   allowed: []
   disallowed: []

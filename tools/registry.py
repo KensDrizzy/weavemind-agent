@@ -60,6 +60,40 @@ class ToolRegistry:
         for tool in tools_list:
             self._tools[tool.name] = tool
 
+        self._register_delegation_tools()
+
+    def _register_delegation_tools(self):
+        """注册子 Agent 委托工具，并注入当前 ToolRegistry 用于隔离加载。"""
+        try:
+            from agents.batch_delegate import BatchDelegateTool
+            from agents.loader import load_agents_from_dir
+            from agents.monitor import SubAgentMonitor
+            from agents.subagent import SubAgentTool
+        except Exception as exc:  # pragma: no cover - 仅导入环境异常时触发
+            logger.warning("子 Agent 委托工具注册失败: %s", exc)
+            return
+
+        agents_dir = _settings_get("agents.dir", ".weavemind/agents")
+        agent_defs = {
+            agent.get("name"): agent
+            for agent in load_agents_from_dir(agents_dir)
+            if agent.get("name")
+        }
+        monitor = SubAgentMonitor(
+            heartbeat_interval=_settings_get("delegation.heartbeat_interval_seconds", 30),
+            stale_cycles_idle=_settings_get("delegation.stale_cycles_idle", 15),
+            stale_cycles_in_tool=_settings_get("delegation.stale_cycles_in_tool", 40),
+        )
+        monitor.start_heartbeat_thread()
+
+        subagent_tool = SubAgentTool(agent_defs=agent_defs, subagent_monitor=monitor)
+        subagent_tool._tool_registry = self
+        batch_tool = BatchDelegateTool(agent_defs=agent_defs, subagent_monitor=monitor)
+        batch_tool._tool_registry = self
+
+        self._tools[subagent_tool.name] = subagent_tool
+        self._tools[batch_tool.name] = batch_tool
+
     def _register_browser_tools(self):
         """注册内置浏览器控制工具（browser_connect/disconnect/status）。
 
@@ -115,3 +149,10 @@ class ToolRegistry:
     def get_langchain_tools(self) -> list:
         """返回 LangChain 工具格式的列表（用于 LLM.bind_tools）。"""
         return self.get_all()
+
+
+def _settings_get(key: str, default=None):
+    try:
+        return settings.get(key, default)
+    except Exception:
+        return default
