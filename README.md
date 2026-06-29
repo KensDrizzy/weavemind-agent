@@ -10,6 +10,7 @@ WeaveMindAgent 是一个面向代码工作的终端 Agent CLI。它基于 LangGr
 - ReAct Agent：模型可按需调用 Read / Write / Edit / Bash / Glob / Grep 等工具完成开发任务。
 - Plan-Execute：复杂任务可先生成 DAG 计划，再按依赖执行任务。
 - Multi-Agent：Supervisor 路由 Planner、Worker、Reviewer，支持执行后审查和失败重试。
+- 子 Agent 委托：`Task` 支持独立 ReAct 子任务，`BatchDelegate` 支持并行委托，并内置工具隔离、非交互审批兜底、心跳和超时治理。
 - 记忆系统：长期记忆、核心记忆和上下文压缩共同维护跨会话项目上下文。
 - 代码 RAG：基于 AST 分块、Chroma 向量库、SQLite FTS5 关键词索引实现混合检索。
 - Web 能力：支持搜索、网页抓取、正文提取、SSRF 防护和多搜索引擎 Provider。
@@ -98,6 +99,15 @@ rag:
 team:
   auto_detect: true
 
+delegation:
+  max_concurrent_children: 3
+  child_timeout_seconds: 600
+  max_result_chars: 8000
+  subagent_auto_approve: false
+  heartbeat_interval_seconds: 30
+  stale_cycles_idle: 15
+  stale_cycles_in_tool: 40
+
 wechat:
   private_chat_only: true
   security:
@@ -162,6 +172,16 @@ think -> route -> plan_or_react -> act -> think -> ... -> END
 - `planner`：只读规划，不执行操作。
 - `worker-1` / `worker-2`：基于 ReAct 执行任务。
 - `reviewer`：审查结果，失败时最多重试 2 次。
+
+### 子 Agent 委托
+
+子 Agent 能力由 `agents/subagent.py`、`agents/batch_delegate.py` 和 `agents/monitor.py` 提供，并通过 `tools/registry.py` 注册到工具系统：
+
+- `Task`：根据 `.weavemind/agents/*.md` 中的 Agent 定义启动一个隔离的 ReAct 子任务。
+- `BatchDelegate`：一次提交多个相互独立的子任务，使用线程池并行执行，并按成功、失败和超时汇总结果。
+- 工具隔离：子 Agent 默认禁止加载 `Task`、`BatchDelegate`、`delegate_task`、`AskUser`、`MemoryAdd`、`MemorySearch` 和 `CoreMemoryEdit`，避免递归委托、后台交互阻塞和共享记忆越权。
+- 审批兜底：危险工具会被非交互审批 wrapper 包装，默认自动拒绝，避免子 Agent 在线程池中等待终端输入。
+- 心跳治理：`SubAgentMonitor` 区分 idle/thinking 和 in-tool 两类停滞场景，默认分别以 450 秒和 1200 秒窗口判定 stale，并支持按子任务中断。
 
 ## 模块实现说明
 
@@ -295,7 +315,9 @@ Chrome DevTools 支持两种模式：
 - `orchestrator.py`：Supervisor 模式的多 Agent 编排。
 - `worker.py`：基于 `create_react_agent` 的 Worker 节点。
 - `reviewer.py`：质量审查节点，JSON 解析失败时保守判定不通过。
-- `subagent.py`：`Task` 子 Agent 工具，可根据 `.weavemind/agents/*.md` 定义启动独立 ReAct 子任务。
+- `subagent.py`：`Task` 子 Agent 工具，可根据 `.weavemind/agents/*.md` 定义启动独立 ReAct 子任务，并负责工具隔离和审批兜底。
+- `batch_delegate.py`：`BatchDelegate` 批量委托工具，负责并行调度、单任务超时、失败隔离和结果汇总。
+- `monitor.py`：子 Agent 心跳监控，负责 stale 检测、暂停和中断。
 - `loader.py`：加载带 YAML frontmatter 的 Agent 定义文件。
 - `agent_state.py`：Multi-Agent 共享状态结构。
 
@@ -342,6 +364,7 @@ pytest tests/test_permissions.py
 pytest tests/test_rag.py
 pytest tests/test_hitl.py
 pytest tests/test_multiagent.py
+pytest tests/test_subagents.py
 pytest tests/test_chrome_mcp.py
 ```
 
