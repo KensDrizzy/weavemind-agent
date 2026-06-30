@@ -5,10 +5,13 @@ Worker 完成后通过 Command 回到 Supervisor。
 """
 
 import logging
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage
+from pydantic import PrivateAttr
 from langgraph.types import Command
+
+from tools.base import WeaveMindTool
 
 # LangGraph V1 起，create_react_agent 迁移到 langchain.agents.create_agent，
 # 参数 prompt → system_prompt。这里做版本兼容：优先用新 API，回退到老 API。
@@ -33,14 +36,70 @@ logger = logging.getLogger(__name__)
 
 WORKER_SYSTEM_PROMPT = (
     "你是一个任务执行专家。根据给定的任务步骤，调用工具完成具体操作。\n\n"
-    "可用工具：Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch, "
-    "MemoryAdd, MemorySearch, CoreMemoryEdit, AskUser\n\n"
+    "可用工具由系统按任务场景注入，可能包含 Read, Write, Edit, Bash, Glob, Grep, "
+    "SearchCode, WebFetch, WebSearch, MemoryAdd, MemorySearch, CoreMemoryEdit, AskUser。\n\n"
     "规则：\n"
-    "- 涉及代码理解时优先使用 Grep/Glob\n"
+    "- 用户询问本地项目、当前代码库、实现逻辑、类/函数/模块时，只能使用本地代码工具。\n"
+    "- 涉及代码理解时优先使用 SearchCode；SearchCode 不可用时再用 Glob/Grep/Read。\n"
+    "- 不要用 WebSearch/WebFetch 搜索当前项目代码，除非用户明确要求联网、官方文档或外部资料。\n"
     "- 每步只做一件事\n"
     "- 完成后简要报告结果\n"
     "- 不要添加不必要的背景说明"
 )
+
+
+class WorkerToolEventWrapper(WeaveMindTool):
+    """Emit tool progress events for tools executed inside a worker agent."""
+
+    _wrapped_tool: Any = PrivateAttr()
+    _hook_manager: Any = PrivateAttr(default=None)
+    _agent_name: str = PrivateAttr(default="")
+
+    def __init__(self, wrapped_tool, hook_manager=None, agent_name: str = "worker"):
+        super().__init__(
+            name=wrapped_tool.name,
+            description=getattr(wrapped_tool, "description", ""),
+            args_schema=getattr(wrapped_tool, "args_schema", None),
+        )
+        self._wrapped_tool = wrapped_tool
+        self._hook_manager = hook_manager
+        self._agent_name = agent_name
+
+    def _run(self, **kwargs):
+        if self._hook_manager:
+            self._hook_manager.emit("PreToolUse", {
+                "agent": self._agent_name,
+                "tool": self.name,
+                "args": kwargs,
+            })
+        try:
+            result = self._wrapped_tool.invoke(kwargs)
+        except Exception as exc:
+            if self._hook_manager:
+                self._hook_manager.emit("PostToolUse", {
+                    "agent": self._agent_name,
+                    "tool": self.name,
+                    "args": kwargs,
+                    "result": str(exc),
+                    "error": True,
+                })
+            raise
+        if self._hook_manager:
+            self._hook_manager.emit("PostToolUse", {
+                "agent": self._agent_name,
+                "tool": self.name,
+                "args": kwargs,
+                "result": str(result)[:500],
+            })
+        return result
+
+    @property
+    def args(self) -> dict:
+        return getattr(self._wrapped_tool, "args", {})
+
+    @property
+    def is_single_input(self) -> bool:
+        return getattr(self._wrapped_tool, "is_single_input", False)
 
 
 def create_worker_node(
@@ -81,6 +140,12 @@ def create_worker_node(
     else:
         # 加载全部工具
         tools = tool_registry.get_langchain_tools()
+
+    if hook_manager:
+        tools = [
+            WorkerToolEventWrapper(tool, hook_manager=hook_manager, agent_name=name)
+            for tool in tools
+        ]
 
     # 用 LangChain create_agent（V1 推荐）/ langgraph.prebuilt（旧版本兜底）创建完整 ReAct Agent
     agent = _make_react_agent(llm, tools, system_prompt=prompt)

@@ -4,11 +4,15 @@ import subprocess
 
 class GrepTool(WeaveMindTool):
     name: str = "Grep"
-    description: str = "Search file contents with regex. Args: pattern, path, flags (optional)"
+    description: str = (
+        "Search file contents with regex. "
+        "Args: pattern, path (optional), glob (optional include pattern like '*.py')"
+    )
 
-    def _run(self, pattern: str, path: str = ".", flags: str = "-r") -> str:
+    def _run(self, pattern: str, path: str = ".", glob: str = "*", flags: str = "-r") -> str:
+        include = glob or "*"
         result = subprocess.run(
-            ["grep", flags, "-n", "--include=*", pattern, path],
+            ["grep", flags, "-n", f"--include={include}", pattern, path],
             capture_output=True, text=True
         )
         return result.stdout or "(no matches)"

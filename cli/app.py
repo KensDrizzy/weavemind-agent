@@ -569,6 +569,8 @@ class WeaveMindCLI:
     def _run_multi_agent(self, user_input: str):
         """以 Multi-Agent 模式执行任务，流式输出每个 Agent 的执行进度。"""
         console.print("\n[cyan]👥 Multi-Agent 协作启动...[/cyan]\n")
+        self.stream_renderer.reset(expanded=self.stream_details_expanded)
+        self.stream_renderer.start()
 
         try:
             from agents.orchestrator import MultiAgentOrchestrator
@@ -581,10 +583,17 @@ class WeaveMindCLI:
                 memory=self.agent_loop.memory,
             )
 
+            latest_step_results = {}
+            latest_messages = []
+
             for event in orchestrator.stream(user_input):
                 for node_name, state in event.items():
                     if state is None or not isinstance(state, dict):
                         continue
+                    if state.get("step_results"):
+                        latest_step_results = state["step_results"]
+                    if state.get("messages"):
+                        latest_messages = state["messages"]
 
                     # 输出每个 Agent 的执行进度
                     if node_name == "supervisor":
@@ -593,6 +602,8 @@ class WeaveMindCLI:
                             console.print(f"[dim]→ 路由到 {next_agent}[/dim]")
                     elif node_name in ("planner", "worker-1", "worker-2"):
                         step_results = state.get("step_results", {})
+                        if node_name == "planner" and state.get("current_task"):
+                            console.print(f"\n[cyan]planner[/cyan]:\n{state['current_task']}")
                         if node_name in step_results:
                             preview = step_results[node_name][:200] + "..." if len(step_results[node_name]) > 200 else step_results[node_name]
                             console.print(f"\n[cyan]{node_name}[/cyan]: {preview}")
@@ -606,16 +617,13 @@ class WeaveMindCLI:
                             elif review_status == "max_retries_exceeded":
                                 console.print("[yellow]超过最大重试次数，保留当前结果[/yellow]")
 
-            # 获取最终状态（stream 最后一个 event 包含完整状态）
-            final_state = state if state else {}
-            step_results = final_state.get("step_results", {})
-            messages = final_state.get("messages", [])
+            step_results = latest_step_results
+            messages = latest_messages
 
             if step_results:
                 console.print("\n[bold]📋 执行结果汇总：[/bold]")
                 for agent_name, agent_result in step_results.items():
-                    preview = agent_result[:200] + "..." if len(agent_result) > 200 else agent_result
-                    console.print(f"  [cyan]{agent_name}[/cyan]: {preview}")
+                    console.print(f"\n[cyan]{agent_name}[/cyan]:\n{agent_result}")
 
             if messages:
                 last_msg = messages[-1]
@@ -627,6 +635,8 @@ class WeaveMindCLI:
         except Exception as e:
             logger.error(f"Multi-Agent 执行错误: {e}", exc_info=True)
             console.print(f"\n[red]❌ Multi-Agent 执行错误: {e}[/red]\n")
+        finally:
+            self.stream_renderer.finish()
 
     def _is_code_related_question(self, user_input: str) -> bool:
         """判断是否为代码库相关问题"""

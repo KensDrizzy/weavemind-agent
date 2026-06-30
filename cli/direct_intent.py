@@ -24,6 +24,8 @@ _LIST_VERBS = r"(列出|查看|显示|有哪些|都有什么|看看|看下|展�
 _READ_VERBS = r"(读取|查看|显示|看看|看下|打开|读|展示|打印)"
 _FIND_VERBS = r"(查找|搜索|找|检索|搜)"
 _INFO_VERBS = r"(多大|多少行|多少文件|多大文件|文件大小|行数|统计)"
+_REASONING_TERMS = r"(分析|解释|总结|说明|梳理|评估|比较|设计|原理|为什么|怎么|如何|实现|架构|流程|机制|原因|建议)"
+_MULTI_STEP_TERMS = r"(然后|并且|再|同时|顺便|接着|之后|并|以及)"
 
 # 目标描述
 _DIR_TARGETS = r"(目录|文件夹|路径)"
@@ -57,6 +59,10 @@ class DirectIntentHandler:
         if re.search(r'https?://', text):
             return None
 
+        # 复合理解任务交给 LLM：直达只适合短小、确定性的本地操作。
+        if self._requires_reasoning(text):
+            return None
+
         # 按优先级尝试各意图
         for handler in [
             self._try_list_dir,
@@ -70,6 +76,21 @@ class DirectIntentHandler:
                 return result
 
         return None
+
+    def _requires_reasoning(self, text: str) -> bool:
+        """判断是否应回退给 LLM，而不是用快速工具结果抢答。"""
+        has_local_action = re.search(
+            rf"({_LIST_VERBS}|{_READ_VERBS}|{_FIND_VERBS}|{_INFO_VERBS})",
+            text,
+            re.IGNORECASE,
+        )
+        if not has_local_action:
+            return False
+
+        has_reasoning = re.search(_REASONING_TERMS, text, re.IGNORECASE)
+        has_multi_step = re.search(_MULTI_STEP_TERMS, text, re.IGNORECASE)
+
+        return bool(has_reasoning and (has_multi_step or len(text) > 18))
 
     # ── 1. 列出目录 ──────────────────────────────────────
 
@@ -351,12 +372,12 @@ class DirectIntentHandler:
 
         # 匹配 "搜索/查找 XXX" 模式
         m = re.search(
-            rf"(?:{_FIND_VERBS})\s*(?:一下|下|的|包含)?\s*([\w\u4e00-\u9fff]+)",
+            rf"(?:{_FIND_VERBS})\s*(?:一下|下|的|包含)?\s*([A-Za-z_][\w.:-]*|[\u4e00-\u9fff]+)",
             text,
             re.IGNORECASE,
         )
         if m:
-            return m.group(1)
+            return m.group(m.lastindex)
 
         return None
 

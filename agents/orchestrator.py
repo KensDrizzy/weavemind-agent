@@ -11,6 +11,7 @@
 
 import json
 import logging
+import os
 import re
 from typing import Literal, Optional
 
@@ -67,6 +68,33 @@ PLANNER_SYSTEM_PROMPT = (
     "- 标注步骤间的依赖关系\n"
     "- 简单任务拆 1-3 步，复杂任务拆 3-7 步"
 )
+
+LOCAL_CODE_PLANNER_RULES = (
+    "\n\n【本地代码库任务硬性规则】\n"
+    "- 用户询问的是当前本地项目，不是公网同名项目。\n"
+    "- 即使任务里出现 WeaveMind/weavemind，也默认指当前工作目录中的本地仓库。\n"
+    "- 不要规划去 GitHub、GitLab、搜索引擎或互联网查找 WeaveMind/weavemind。\n"
+    "- 不要写“开源平台搜索”“查找官方仓库”“克隆仓库”之类的外部检索步骤。\n"
+    "- 第一步必须在当前工作目录内检索代码：优先 SearchCode；不可用时使用 Glob/Grep/Read。\n"
+    "- 计划中必须点名本地路径或模块，例如 agents/、core/、tools/、cli/。\n"
+    "- 只有用户明确要求外部资料、官方文档、最新信息时，才允许规划联网搜索。\n"
+)
+
+LOCAL_CODE_TASK_KEYWORDS = (
+    "代码", "代码库", "项目", "当前项目", "本地", "实现", "类", "函数", "方法",
+    "模块", "架构", "逻辑", "subagent", "multi-agent", "weavemind",
+    "code", "repo", "repository", "project", "implementation", "class",
+    "function", "method", "module",
+)
+
+LOCAL_CODE_WORKER_TOOLS = [
+    "SearchCode",
+    "Read",
+    "Glob",
+    "Grep",
+    "Task",
+    "BatchDelegate",
+]
 
 
 def _build_router_model(options: list[str]):
@@ -220,7 +248,9 @@ def make_supervisor_node(llm, members: list[str]):
         # 硬性规则：根据已工作 Agent 状态，跳过 LLM 决策直接路由
         # 这避免 LLM 重复路由到已完成的 Agent
         force_route = None
-        if "planner" in worked_agents and "worker-1" not in worked_agents:
+        if not worked_agents and "planner" in members:
+            force_route = "planner"
+        elif "planner" in worked_agents and "worker-1" not in worked_agents:
             force_route = "worker-1"
         elif "worker-1" in worked_agents and "reviewer" not in worked_agents and review_status is None:
             force_route = "reviewer"
@@ -319,6 +349,7 @@ class MultiAgentOrchestrator:
                 permission_policy=self.permission_policy,
                 hook_manager=self.hook_manager,
                 name=worker_name,
+                tool_names=self._worker_tool_names,
             )
             builder.add_node(worker_name, worker_node)
 
@@ -331,13 +362,34 @@ class MultiAgentOrchestrator:
 
         return builder.compile()
 
+    @property
+    def _worker_tool_names(self) -> list[str] | None:
+        return getattr(self, "_current_worker_tool_names", None)
+
+    def _select_worker_tools(self, user_input: str) -> list[str] | None:
+        """Restrict worker tools for local code tasks so they cannot drift to the web."""
+        lowered = user_input.lower()
+        if not any(keyword.lower() in lowered for keyword in LOCAL_CODE_TASK_KEYWORDS):
+            return None
+
+        available = []
+        for name in LOCAL_CODE_WORKER_TOOLS:
+            if self.tool_registry.get(name):
+                available.append(name)
+        return available or None
+
     def _make_planner_node(self):
         """创建 Planner 节点：分析任务并输出执行计划。"""
 
         def planner_node(state: MultiAgentState) -> Command[Literal["supervisor"]]:
             """Planner 规划节点。"""
+            system_prompt = PLANNER_SYSTEM_PROMPT
+            if self._worker_tool_names is not None:
+                system_prompt += LOCAL_CODE_PLANNER_RULES
+                system_prompt += f"\n当前本地仓库路径：{os.getcwd()}\n"
+
             messages = [
-                SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+                SystemMessage(content=system_prompt),
                 HumanMessage(content=state["messages"][-1].content),
             ]
             response = self.llm.invoke(messages)
@@ -363,6 +415,9 @@ class MultiAgentOrchestrator:
         Returns:
             最终状态字典
         """
+        self._current_worker_tool_names = self._select_worker_tools(user_input)
+        self.graph = self._build_graph()
+
         initial_state = {
             "messages": [HumanMessage(content=user_input)],
             "next": "",
@@ -377,6 +432,9 @@ class MultiAgentOrchestrator:
 
     def stream(self, user_input: str):
         """流式执行 Multi-Agent 协作，yield 每步状态。"""
+        self._current_worker_tool_names = self._select_worker_tools(user_input)
+        self.graph = self._build_graph()
+
         initial_state = {
             "messages": [HumanMessage(content=user_input)],
             "next": "",

@@ -39,3 +39,13 @@ def test_grep(tmp_path):
     (tmp_path / "f.py").write_text("def my_func(): pass")
     result = GrepTool()._run(pattern="my_func", path=str(tmp_path))
     assert "my_func" in result
+
+
+def test_grep_accepts_glob_include(tmp_path):
+    (tmp_path / "f.py").write_text("def my_func(): pass")
+    (tmp_path / "f.txt").write_text("my_func in text")
+
+    result = GrepTool()._run(pattern="my_func", path=str(tmp_path), glob="*.py")
+
+    assert "f.py" in result
+    assert "f.txt" not in result

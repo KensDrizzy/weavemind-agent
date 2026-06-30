@@ -9,8 +9,10 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from agents.agent_state import MultiAgentState
 from agents.reviewer import parse_review_approval, create_reviewer_node, MAX_RETRIES
 from agents.orchestrator import make_supervisor_node, MultiAgentOrchestrator
+from agents.worker import WorkerToolEventWrapper
 from agents.loader import load_agent_def, load_agents_by_role
 from core.agent_loop import AgentLoop, COMPLEXITY_PROMPT
+from tools.base import WeaveMindTool
 
 
 # ── parse_review_approval 测试 ──────────────────────────────
@@ -178,7 +180,7 @@ class TestSupervisorNode:
     """Supervisor 节点测试。"""
 
     def test_supervisor_routes_to_agent_from_text(self):
-        """Supervisor 能从纯文本回复中路由到指定 Agent。"""
+        """首轮任务固定路由到 planner，避免多一次 LLM 调用。"""
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = MagicMock(content="planner")
 
@@ -191,23 +193,24 @@ class TestSupervisorNode:
 
         assert result.goto == "planner"
         assert result.update["next"] == "planner"
+        mock_llm.invoke.assert_not_called()
 
     def test_supervisor_routes_from_json_with_agent_field(self):
         """Supervisor 能从 JSON 回复（字段名为 agent）中提取路由。"""
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = MagicMock(
-            content='{"agent": "planner", "reason": "新任务需要规划"}'
+            content='{"agent": "worker-1", "reason": "继续执行"}'
         )
 
-        supervisor_node = make_supervisor_node(mock_llm, ["planner", "worker-1", "reviewer"])
+        supervisor_node = make_supervisor_node(mock_llm, ["worker-1", "reviewer"])
         state = {
             "messages": [MagicMock(content="创建项目")],
             "next": "",
         }
         result = supervisor_node(state)
 
-        assert result.goto == "planner"
-        assert result.update["next"] == "planner"
+        assert result.goto == "worker-1"
+        assert result.update["next"] == "worker-1"
 
     def test_supervisor_routes_from_json_with_next_agent_field(self):
         """Supervisor 能从 JSON 回复（字段名为 next_agent）中提取路由。"""
@@ -216,7 +219,7 @@ class TestSupervisorNode:
             content='{"next_agent": "worker-1", "task": "执行操作"}'
         )
 
-        supervisor_node = make_supervisor_node(mock_llm, ["planner", "worker-1", "reviewer"])
+        supervisor_node = make_supervisor_node(mock_llm, ["worker-1", "reviewer"])
         state = {
             "messages": [MagicMock(content="执行任务")],
             "next": "",
@@ -230,7 +233,7 @@ class TestSupervisorNode:
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = MagicMock(content="FINISH")
 
-        supervisor_node = make_supervisor_node(mock_llm, ["planner", "worker-1"])
+        supervisor_node = make_supervisor_node(mock_llm, ["worker-1"])
         state = {
             "messages": [MagicMock(content="任务完成")],
             "next": "",
@@ -246,7 +249,7 @@ class TestSupervisorNode:
             content='{"next": "FINISH"}'
         )
 
-        supervisor_node = make_supervisor_node(mock_llm, ["planner"])
+        supervisor_node = make_supervisor_node(mock_llm, ["worker-1"])
         state = {
             "messages": [MagicMock(content="完成")],
             "next": "",
@@ -260,7 +263,7 @@ class TestSupervisorNode:
         mock_llm = MagicMock()
         mock_llm.invoke.side_effect = Exception("LLM 错误")
 
-        supervisor_node = make_supervisor_node(mock_llm, ["planner"])
+        supervisor_node = make_supervisor_node(mock_llm, ["worker-1"])
         state = {
             "messages": [MagicMock(content="测试")],
             "next": "",
@@ -274,7 +277,7 @@ class TestSupervisorNode:
         mock_llm = MagicMock()
         mock_llm.invoke.return_value = MagicMock(content="unknown_agent")
 
-        supervisor_node = make_supervisor_node(mock_llm, ["planner"])
+        supervisor_node = make_supervisor_node(mock_llm, ["worker-1"])
         state = {
             "messages": [MagicMock(content="测试")],
             "next": "",
@@ -323,6 +326,7 @@ class TestMultiAgentOrchestrator:
         orchestrator = MultiAgentOrchestrator(
             llm=mock_llm,
             tool_registry=mock_registry,
+            num_workers=0,
         )
         assert orchestrator.graph is not None
 
@@ -335,10 +339,124 @@ class TestMultiAgentOrchestrator:
         orchestrator = MultiAgentOrchestrator(
             llm=mock_llm,
             tool_registry=mock_registry,
+            num_workers=0,
         )
         result = orchestrator.run("测试任务")
         assert "messages" in result
         assert "step_results" in result
+
+    def test_local_code_task_restricts_worker_web_tools(self):
+        """本地代码分析任务不应把 WebSearch/WebFetch 暴露给 worker。"""
+        mock_llm = self._make_mock_llm()
+        available = {
+            "SearchCode",
+            "Read",
+            "Glob",
+            "Grep",
+            "Task",
+            "BatchDelegate",
+            "WebSearch",
+            "WebFetch",
+        }
+        mock_registry = MagicMock()
+        mock_registry.get.side_effect = lambda name: object() if name in available else None
+        mock_registry.get_langchain_tools.return_value = []
+
+        orchestrator = MultiAgentOrchestrator(
+            llm=mock_llm,
+            tool_registry=mock_registry,
+        )
+
+        tools = orchestrator._select_worker_tools(
+            "检索一下weavemind的代码，然后分析multi-agent的subagent怎么实现"
+        )
+
+        assert "SearchCode" in tools
+        assert "Read" in tools
+        assert "Grep" in tools
+        assert "WebSearch" not in tools
+        assert "WebFetch" not in tools
+
+    def test_non_code_task_keeps_worker_tools_unrestricted(self):
+        """非本地代码任务不使用本地代码工具白名单。"""
+        mock_llm = self._make_mock_llm()
+        mock_registry = MagicMock()
+        mock_registry.get.return_value = object()
+        mock_registry.get_langchain_tools.return_value = []
+
+        orchestrator = MultiAgentOrchestrator(
+            llm=mock_llm,
+            tool_registry=mock_registry,
+        )
+
+        assert orchestrator._select_worker_tools("搜索今天的 AI 新闻并总结") is None
+
+    def test_local_code_task_adds_planner_local_repo_rules(self):
+        """本地代码任务的 planner 也必须被约束，不能规划公网同名项目检索。"""
+        mock_llm = self._make_mock_llm([MagicMock(content="1. 使用 SearchCode 检索本地 agents/")])
+        mock_registry = MagicMock()
+        mock_registry.get.return_value = object()
+        mock_registry.get_langchain_tools.return_value = []
+        orchestrator = MultiAgentOrchestrator(
+            llm=mock_llm,
+            tool_registry=mock_registry,
+            num_workers=0,
+        )
+        orchestrator._current_worker_tool_names = ["SearchCode", "Read", "Glob", "Grep"]
+        planner_node = orchestrator._make_planner_node()
+
+        planner_node({
+            "messages": [
+                HumanMessage(content="检索一下weavemind的代码，然后分析multi-agent的subagent怎么实现")
+            ],
+            "next": "",
+            "current_task": None,
+            "step_results": {},
+            "review_status": None,
+            "retry_count": 0,
+        })
+
+        sent_messages = mock_llm.invoke.call_args.args[0]
+        system_prompt = sent_messages[0].content
+        assert "当前本地项目" in system_prompt
+        assert "不要规划去 GitHub、GitLab、搜索引擎或互联网" in system_prompt
+        assert "当前本地仓库路径" in system_prompt
+        assert "SearchCode" in system_prompt
+
+
+class DummyWorkerTool(WeaveMindTool):
+    name: str = "Dummy"
+    description: str = "Dummy tool. Args: value"
+
+    def _run(self, value: str) -> str:
+        return f"ok:{value}"
+
+
+class TestWorkerToolEventWrapper:
+    """Worker 工具事件包装测试。"""
+
+    def test_emits_pre_and_post_tool_events(self):
+        hook_manager = MagicMock()
+        tool = WorkerToolEventWrapper(
+            DummyWorkerTool(),
+            hook_manager=hook_manager,
+            agent_name="worker-1",
+        )
+
+        result = tool._run(value="x")
+
+        assert result == "ok:x"
+        hook_manager.emit.assert_any_call("PreToolUse", {
+            "agent": "worker-1",
+            "tool": "Dummy",
+            "args": {"value": "x"},
+        })
+        hook_manager.emit.assert_any_call("PostToolUse", {
+            "agent": "worker-1",
+            "tool": "Dummy",
+            "args": {"value": "x"},
+            "result": "ok:x",
+        })
 
 
 # ── classify_complexity 测试 ──────────────────────────────────
@@ -506,6 +624,65 @@ class TestShouldAutoTeam:
         cli._should_auto_team.assert_not_called()
         cli._run_multi_agent.assert_not_called()
         cli.agent_loop.stream_with_history.assert_called_once()
+
+    def test_multi_agent_summary_prints_full_result(self):
+        """最终汇总应打印完整 worker 输出，而不是 200 字符预览。"""
+        from cli.app import WeaveMindCLI
+
+        long_result = "A" * 260 + "TAIL"
+
+        cli = WeaveMindCLI.__new__(WeaveMindCLI)
+        cli.agent_loop = MagicMock()
+        cli.agent_loop.llm = MagicMock()
+        cli.agent_loop.tool_registry = MagicMock()
+        cli.agent_loop.permission_policy = MagicMock()
+        cli.agent_loop.hook_manager = MagicMock()
+        cli.agent_loop.memory = MagicMock()
+        cli.stream_details_expanded = False
+        cli.stream_renderer = MagicMock()
+
+        fake_orchestrator = MagicMock()
+        fake_orchestrator.stream.return_value = iter([
+            {"worker-1": {"step_results": {"worker-1": long_result}}},
+        ])
+
+        with patch("agents.orchestrator.MultiAgentOrchestrator", return_value=fake_orchestrator):
+            with patch("cli.app.console") as mock_console:
+                cli._run_multi_agent("测试任务")
+
+        rendered = "\n".join(str(call.args[0]) for call in mock_console.print.call_args_list if call.args)
+        assert "TAIL" in rendered
+        assert long_result in rendered
+
+    def test_multi_agent_summary_keeps_worker_result_when_reviewer_is_last_event(self):
+        """stream 最后一个事件可能是 reviewer，CLI 仍应保留 worker 完整输出。"""
+        from cli.app import WeaveMindCLI
+
+        worker_result = "完整 worker 输出"
+
+        cli = WeaveMindCLI.__new__(WeaveMindCLI)
+        cli.agent_loop = MagicMock()
+        cli.agent_loop.llm = MagicMock()
+        cli.agent_loop.tool_registry = MagicMock()
+        cli.agent_loop.permission_policy = MagicMock()
+        cli.agent_loop.hook_manager = MagicMock()
+        cli.agent_loop.memory = MagicMock()
+        cli.stream_details_expanded = False
+        cli.stream_renderer = MagicMock()
+
+        fake_orchestrator = MagicMock()
+        fake_orchestrator.stream.return_value = iter([
+            {"worker-1": {"step_results": {"worker-1": worker_result}}},
+            {"reviewer": {"review_status": "approved"}},
+        ])
+
+        with patch("agents.orchestrator.MultiAgentOrchestrator", return_value=fake_orchestrator):
+            with patch("cli.app.console") as mock_console:
+                cli._run_multi_agent("测试任务")
+
+        rendered = "\n".join(str(call.args[0]) for call in mock_console.print.call_args_list if call.args)
+        assert "📋 执行结果汇总" in rendered
+        assert worker_result in rendered
 
 
 class TestConversationCompaction:

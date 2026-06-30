@@ -452,17 +452,20 @@ class InteractionStreamRenderer:
     def on_tool_start(self, data: dict):
         tool = data.get("tool", "Unknown")
         args = data.get("args") or {}
+        agent = data.get("agent")
         title, detail = self._tool_text(tool, args)
         with self._lock:
             # 默认只显示工具名称简略行；展开时显示参数
             if self._expanded:
-                self.console.print(f"\n• {title}")
+                prefix = f"[{agent}] " if agent else ""
+                self.console.print(f"\n• {prefix}{title}")
                 if detail:
                     self.console.print(f"  └ {detail}", style="dim")
             else:
                 # 简略模式：只显示工具简称（不换行）
                 emoji = self._tool_emoji(tool)
-                self.console.print(f"  {emoji}   {tool}", end=" ")
+                prefix = f"{agent}:" if agent else ""
+                self.console.print(f"  {prefix}{emoji} {tool}", end=" ")
 
     def on_tool_end(self, data: dict):
         if not self._expanded:
