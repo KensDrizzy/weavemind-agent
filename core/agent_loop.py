@@ -459,19 +459,28 @@ class AgentLoop:
         if re.search(r"https?://", text):
             return False
 
-        knowledge_cues = (
-            "上传", "资料", "知识库", "文档", "文件", "pdf", "word", "docx",
-            "合同", "制度", "手册", "规范", "政策", "条款", "报告", "简历",
-            "这份", "这篇", "里面说", "文中", "材料", "附件", "图片",
-            "knowledge", "document", "uploaded", "attachment", "file",
-            "manual", "policy", "contract", "report",
+        # 强意图词：用户明确指向知识库/上传资料
+        strong_cues = (
+            "知识库", "资料", "上传", "文档", "手册", "制度", "合同",
+            "规范", "政策", "条款", "报告", "附件", "pdf", "word", "docx",
+            "knowledge", "uploaded", "attachment", "document", "manual",
+            "policy", "contract", "report",
+        )
+        if any(cue in text for cue in strong_cues):
+            return True
+
+        # 弱意图词需要配合疑问词才触发
+        weak_cues = (
+            "文件", "简历", "这份", "这篇", "里面说", "文中", "材料", "图片",
+            "file", "image",
         )
         question_terms = (
             "是什么", "有哪些", "说明", "总结", "概括", "提取", "查找",
-            "检索", "引用", "依据", "出处", "第几页", "怎么规定",
-            "what", "which", "summarize", "find", "search", "cite",
+            "检索", "引用", "依据", "出处", "第几页", "怎么规定", "怎么说",
+            "如何规定", "内容",
+            "what", "which", "summarize", "find", "search", "cite", "how",
         )
-        return any(cue in text for cue in knowledge_cues) and any(term in text for term in question_terms)
+        return any(cue in text for cue in weak_cues) and any(term in text for term in question_terms)
 
     def _build_graph(self) -> StateGraph:
         """构建 LangGraph 状态图。"""

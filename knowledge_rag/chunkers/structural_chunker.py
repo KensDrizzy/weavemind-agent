@@ -22,14 +22,14 @@ class StructuralChunker:
         current: list[ParsedElement] = []
         current_len = 0
 
-        def flush():
+        def flush(carry_overlap: bool = True):
             nonlocal current, current_len
             if not current:
                 return
             content = self._render_elements(current)
             if content.strip():
                 chunks.append(self._make_chunk(document, content, current, len(chunks)))
-            overlap = self._tail_overlap(current)
+            overlap = self._tail_overlap(current) if carry_overlap else []
             current = overlap
             current_len = sum(len(e.text) for e in current)
 
@@ -37,25 +37,24 @@ class StructuralChunker:
             text_len = len(element.text)
             starts_new_section = element.element_type == "title" and current
             would_overflow = current and current_len + text_len > self.max_chars
-            if starts_new_section or would_overflow:
-                flush()
+            if starts_new_section:
+                # 章节边界：不要把上一节内容 overlap 到下一节
+                flush(carry_overlap=False)
+            elif would_overflow:
+                flush(carry_overlap=True)
 
             if text_len > self.max_chars:
                 for part in self._split_large_text(element.text):
                     split_element = element.model_copy(update={"text": part})
                     current.append(split_element)
                     current_len += len(part)
-                    flush()
+                    flush(carry_overlap=True)
                 continue
 
             current.append(element)
             current_len += text_len
 
-        current_len_before_flush = current_len
-        if current_len_before_flush:
-            current_saved = current
-            current = current_saved
-            current_len = current_len_before_flush
+        if current:
             content = self._render_elements(current)
             if content.strip():
                 chunks.append(self._make_chunk(document, content, current, len(chunks)))
@@ -74,6 +73,11 @@ class StructuralChunker:
         element_type = first.element_type
         if any(e.element_type == "table" for e in elements):
             element_type = "table"
+        # 使用 chunk 内最深（最后）的标题路径，避免子章节被归为顶层
+        section_path = first.section_path
+        for e in elements:
+            if e.element_type == "title" and len(e.section_path) >= len(section_path):
+                section_path = e.section_path
         return KnowledgeChunk(
             chunk_id=chunk_id,
             doc_id=document.doc_id,
@@ -84,7 +88,7 @@ class StructuralChunker:
             file_name=document.file_name,
             content=content,
             page_number=first.page_number,
-            section_path=list(first.section_path),
+            section_path=list(section_path),
             element_type=element_type,
             bbox=first.bbox,
             created_at=time.time(),
@@ -118,7 +122,10 @@ class StructuralChunker:
             return []
         kept: list[ParsedElement] = []
         total = 0
+        # 标题只起导航作用，重复放入 overlap 会造成后续 chunk 开头堆积标题
         for element in reversed(elements):
+            if element.element_type == "title":
+                continue
             total += len(element.text)
             kept.append(element)
             if total >= self.overlap_chars:

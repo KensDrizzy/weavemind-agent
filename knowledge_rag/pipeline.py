@@ -378,14 +378,22 @@ class KnowledgeRAGPipeline:
             raise FileNotFoundError(str(path))
         files: list[Path] = []
         ignored_dirs = {".git", ".weavemind", "node_modules", "__pycache__", ".venv", "venv"}
+        # 避免把向量/关键词库的 SQLite 自身文件当资料索引（root_dir 与元数据目录可能重合）
+        ignored_exts = {".db", ".db-shm", ".db-wal", ".db-journal", ".lock", ".tmp"}
         for root, dirs, names in os.walk(path):
             dirs[:] = [d for d in dirs if d not in ignored_dirs]
             for name in names:
                 candidate = Path(root) / name
-                if candidate.is_file() and not name.startswith("."):
-                    files.append(candidate)
-                    if len(files) >= max_files:
-                        return files
+                if not candidate.is_file() or name.startswith("."):
+                    continue
+                lower = name.lower()
+                if any(lower.endswith(ext) for ext in ignored_exts):
+                    continue
+                if lower.startswith("knowledge.db"):
+                    continue
+                files.append(candidate)
+                if len(files) >= max_files:
+                    return files
         return files
 
     @staticmethod

@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from rich.markup import escape
 
 import settings
 
@@ -311,15 +312,17 @@ def _handle_kb(parts: list, knowledge_pipeline=None):
 
     subcmd = parts[1].lower()
     collection, rest = _parse_collection_arg(parts[2:])
+    # 除 list 外，未指定集合时默认使用 default
+    target_collection = collection or "default"
 
     if subcmd == "add":
         if not rest:
             console.print("\n[yellow]用法: /kb add <file-or-dir> [--collection name][/yellow]\n")
             return
         path = rest[0]
-        console.print(f"\n[cyan]📚 正在索引资料: {path} (collection={collection}) ...[/cyan]")
+        console.print(f"\n[cyan]📚 正在索引资料: {path} (collection={target_collection}) ...[/cyan]")
         try:
-            stats = knowledge_pipeline.index_path(path, collection_id=collection)
+            stats = knowledge_pipeline.index_path(path, collection_id=target_collection)
             console.print("\n[green]✅ 资料索引完成！[/green]")
             console.print(f"  文档数: {stats.total_documents}")
             console.print(f"  新增 chunk: {stats.indexed_chunks}")
@@ -335,7 +338,7 @@ def _handle_kb(parts: list, knowledge_pipeline=None):
             console.print("\n[yellow]用法: /kb search <query> [--collection name][/yellow]\n")
             return
         try:
-            results = knowledge_pipeline.search(query, top_k=8, collection_id=collection)
+            results = knowledge_pipeline.search(query, top_k=8, collection_id=target_collection)
         except Exception as e:
             console.print(f"\n[red]❌ 资料检索失败: {e}[/red]\n")
             return
@@ -344,8 +347,9 @@ def _handle_kb(parts: list, knowledge_pipeline=None):
             return
         console.print(f"\n[green]找到 {len(results)} 个相关资料片段：[/green]\n")
         for i, r in enumerate(results, 1):
-            console.print(f"  [{i}] {r.chunk.citation()} score={r.score:.3f} source={r.source}")
-            content = r.chunk.content.replace("\n", " ")
+            citation = escape(r.chunk.citation())
+            console.print(f"  [{i}] {citation} score={r.score:.3f} source={r.source}")
+            content = escape(r.chunk.content.replace("\n", " "))
             if len(content) > 220:
                 content = content[:220] + "..."
             console.print(f"  [dim]{content}[/dim]\n")
@@ -356,7 +360,7 @@ def _handle_kb(parts: list, knowledge_pipeline=None):
             console.print("\n[yellow]用法: /kb ask <query> [--collection name][/yellow]\n")
             return
         try:
-            answer_context = knowledge_pipeline.ask(query, collection_id=collection)
+            answer_context = knowledge_pipeline.ask(query, collection_id=target_collection)
             console.print()
             console.print(Panel(answer_context, title="Knowledge Evidence", border_style="cyan"))
             console.print()
@@ -364,7 +368,9 @@ def _handle_kb(parts: list, knowledge_pipeline=None):
             console.print(f"\n[red]❌ 资料问答失败: {e}[/red]\n")
 
     elif subcmd == "list":
-        docs = knowledge_pipeline.list_documents(collection_id=collection)
+        # list 不传 --collection 时展示所有集合的文档，避免用户误以为没数据
+        list_collection = collection if collection else None
+        docs = knowledge_pipeline.list_documents(collection_id=list_collection)
         if not docs:
             console.print("\n[dim]知识库暂无已索引文档[/dim]\n")
             return
@@ -390,7 +396,7 @@ def _handle_kb(parts: list, knowledge_pipeline=None):
             console.print(f"\n[dim]未找到文档: {doc_id}[/dim]\n")
 
     elif subcmd == "reindex":
-        stats = knowledge_pipeline.reindex(collection_id=collection)
+        stats = knowledge_pipeline.reindex(collection_id=target_collection)
         console.print("\n[green]✅ 知识库重建完成！[/green]")
         console.print(f"  文档数: {stats.total_documents}")
         console.print(f"  重建 chunk: {stats.indexed_chunks}")
@@ -401,8 +407,8 @@ def _handle_kb(parts: list, knowledge_pipeline=None):
         _print_kb_usage()
 
 
-def _parse_collection_arg(args: list) -> tuple[str, list]:
-    collection = "default"
+def _parse_collection_arg(args: list) -> tuple[str | None, list]:
+    collection: str | None = None
     rest: list = []
     i = 0
     while i < len(args):
