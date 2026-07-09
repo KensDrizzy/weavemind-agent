@@ -91,6 +91,45 @@ rag:
     ttl_seconds: 300
     max_entries: 128
 
+knowledge_rag:
+  enabled: false
+  force_search_knowledge: true
+  root_dir: .weavemind/knowledge
+  sqlite_db: .weavemind/knowledge/knowledge.db
+  incremental_sync_before_search: true
+  parser:
+    provider: plain-text      # plain-text | docling | unstructured
+    fallback: unstructured    # 主 parser 返回空或失败时回退
+  vector_store:
+    provider: milvus          # sqlite | milvus
+    uri: http://localhost:19530
+    token: ""
+  keyword_store:
+    provider: sqlite_fts
+  embedding:
+    provider: openai          # openai | ollama | hash（仅测试/离线）
+    model: text-embedding-3-small
+    dimension: 1536
+    revision: "1"
+    # base_url:
+    # api_key:
+    # api_key_env:
+  chunking:
+    max_chars: 3600
+    overlap_chars: 400
+  retrieval:
+    fusion: rrf
+    top_k: 8
+    rrf_k: 60
+    max_context_chars: 8000
+    rerank:
+      enabled: true
+      method: heuristic       # heuristic | cross_encoder | llm
+      top_n: 20
+      model: cross-encoder/ms-marco-MiniLM-L-6-v2
+      # provider:
+      # llm_model:
+
 # 微信 iLink 通道（独立运行：weavemind wechat setup/start）
 wechat:
   api_base_url: https://ilinkai.weixin.qq.com
@@ -112,6 +151,8 @@ wechat:
       - Glob
       - Grep
       - SearchCode
+      - SearchKnowledge
+      - AskKnowledge
       - WebSearch
       - WebFetch
       - MemorySearch

@@ -14,7 +14,14 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
-def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None, mcp_manager=None) -> bool:
+def handle_command(
+    cmd: str,
+    agent_loop,
+    session_manager,
+    rag_pipeline=None,
+    knowledge_pipeline=None,
+    mcp_manager=None,
+) -> bool:
     """Returns True if command was handled, str for mode change, 'plan_mode' for /plan toggle."""
     parts = cmd.strip().split()
     name = parts[0].lower()
@@ -28,6 +35,7 @@ def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None, mcp
         help_table.add_row("/save <事实>", "手动保存事实到长期记忆")
         help_table.add_row("/index [目录]", "索引代码库（建立 RAG 检索数据库）")
         help_table.add_row("/search <关键词>", "手动检索代码库中的相关代码")
+        help_table.add_row("/kb add/search/ask/list/delete/reindex", "管理和检索资料知识库")
         help_table.add_row("/sessions", "列出所有保存的会话")
         help_table.add_row("/mode [MODE]", "切换权限模式 (default | acceptEdits | bypassPermissions)")
         help_table.add_row("/hitl [on|off|status]", "人工审批模式（默认启用，/hitl off 关闭）")
@@ -87,6 +95,9 @@ def handle_command(cmd: str, agent_loop, session_manager, rag_pipeline=None, mcp
 
     elif name == "/search":
         _search_code(parts, rag_pipeline)
+
+    elif name == "/kb":
+        _handle_kb(parts, knowledge_pipeline)
 
     elif name == "/hitl":
         _handle_hitl(parts, agent_loop)
@@ -277,6 +288,138 @@ def _search_code(parts: list, rag_pipeline=None):
             console.print()
     except Exception as e:
         console.print(f"\n[red]❌ 检索失败: {e}[/red]\n")
+
+
+def _handle_kb(parts: list, knowledge_pipeline=None):
+    """管理资料知识库。
+
+    用法:
+        /kb add <file-or-dir> [--collection name]
+        /kb search <query> [--collection name]
+        /kb ask <query> [--collection name]
+        /kb list [--collection name]
+        /kb delete <doc_id>
+        /kb reindex [--collection name]
+    """
+    if not settings.get("knowledge_rag.enabled", False) or not knowledge_pipeline:
+        console.print("\n[red]❌ Knowledge RAG 未启用。请在 config.yaml 中设置 knowledge_rag.enabled: true[/red]\n")
+        return
+
+    if len(parts) < 2:
+        _print_kb_usage()
+        return
+
+    subcmd = parts[1].lower()
+    collection, rest = _parse_collection_arg(parts[2:])
+
+    if subcmd == "add":
+        if not rest:
+            console.print("\n[yellow]用法: /kb add <file-or-dir> [--collection name][/yellow]\n")
+            return
+        path = rest[0]
+        console.print(f"\n[cyan]📚 正在索引资料: {path} (collection={collection}) ...[/cyan]")
+        try:
+            stats = knowledge_pipeline.index_path(path, collection_id=collection)
+            console.print("\n[green]✅ 资料索引完成！[/green]")
+            console.print(f"  文档数: {stats.total_documents}")
+            console.print(f"  新增 chunk: {stats.indexed_chunks}")
+            console.print(f"  跳过重复: {stats.skipped_documents}")
+            console.print(f"  失败: {stats.failed_documents}")
+            console.print(f"  耗时: {stats.index_time:.1f}s\n")
+        except Exception as e:
+            console.print(f"\n[red]❌ 资料索引失败: {e}[/red]\n")
+
+    elif subcmd == "search":
+        query = " ".join(rest).strip()
+        if not query:
+            console.print("\n[yellow]用法: /kb search <query> [--collection name][/yellow]\n")
+            return
+        try:
+            results = knowledge_pipeline.search(query, top_k=8, collection_id=collection)
+        except Exception as e:
+            console.print(f"\n[red]❌ 资料检索失败: {e}[/red]\n")
+            return
+        if not results:
+            console.print(f"\n[dim]未找到与 '{query}' 相关的资料[/dim]\n")
+            return
+        console.print(f"\n[green]找到 {len(results)} 个相关资料片段：[/green]\n")
+        for i, r in enumerate(results, 1):
+            console.print(f"  [{i}] {r.chunk.citation()} score={r.score:.3f} source={r.source}")
+            content = r.chunk.content.replace("\n", " ")
+            if len(content) > 220:
+                content = content[:220] + "..."
+            console.print(f"  [dim]{content}[/dim]\n")
+
+    elif subcmd == "ask":
+        query = " ".join(rest).strip()
+        if not query:
+            console.print("\n[yellow]用法: /kb ask <query> [--collection name][/yellow]\n")
+            return
+        try:
+            answer_context = knowledge_pipeline.ask(query, collection_id=collection)
+            console.print()
+            console.print(Panel(answer_context, title="Knowledge Evidence", border_style="cyan"))
+            console.print()
+        except Exception as e:
+            console.print(f"\n[red]❌ 资料问答失败: {e}[/red]\n")
+
+    elif subcmd == "list":
+        docs = knowledge_pipeline.list_documents(collection_id=collection)
+        if not docs:
+            console.print("\n[dim]知识库暂无已索引文档[/dim]\n")
+            return
+        table = Table(title=f"📚 Knowledge Documents ({len(docs)})", show_header=True)
+        table.add_column("doc_id", style="dim")
+        table.add_column("file")
+        table.add_column("collection")
+        table.add_column("chunks", justify="right")
+        for doc in docs:
+            table.add_row(doc.doc_id[:12], doc.file_name, doc.collection_id, str(doc.chunk_count))
+        console.print()
+        console.print(table)
+        console.print()
+
+    elif subcmd == "delete":
+        if not rest:
+            console.print("\n[yellow]用法: /kb delete <doc_id>[/yellow]\n")
+            return
+        doc_id = rest[0]
+        if knowledge_pipeline.delete_document(doc_id):
+            console.print(f"\n[green]✅ 已删除文档: {doc_id}[/green]\n")
+        else:
+            console.print(f"\n[dim]未找到文档: {doc_id}[/dim]\n")
+
+    elif subcmd == "reindex":
+        stats = knowledge_pipeline.reindex(collection_id=collection)
+        console.print("\n[green]✅ 知识库重建完成！[/green]")
+        console.print(f"  文档数: {stats.total_documents}")
+        console.print(f"  重建 chunk: {stats.indexed_chunks}")
+        console.print(f"  失败: {stats.failed_documents}")
+        console.print(f"  耗时: {stats.index_time:.1f}s\n")
+
+    else:
+        _print_kb_usage()
+
+
+def _parse_collection_arg(args: list) -> tuple[str, list]:
+    collection = "default"
+    rest: list = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--collection" and i + 1 < len(args):
+            collection = args[i + 1]
+            i += 2
+        else:
+            rest.append(args[i])
+            i += 1
+    return collection, rest
+
+
+def _print_kb_usage():
+    console.print("\n[yellow]用法: /kb [add|search|ask|list|delete|reindex] ...[/yellow]")
+    console.print("[dim]示例: /kb add docs/plan.md --collection product[/dim]")
+    console.print("[dim]示例: /kb search 合同终止条件 --collection legal[/dim]")
+    console.print("[dim]示例: /kb ask 这份资料的建设阶段是什么 --collection product[/dim]\n")
 
 
 def _handle_hitl(parts: list, agent_loop):

@@ -357,14 +357,46 @@ class AgentLoop:
             }],
         )
 
+    def _maybe_force_search_knowledge(self, messages: list) -> Optional[AIMessage]:
+        """对上传资料/知识库类问题强制首跳 AskKnowledge。"""
+        if getattr(self, "force_plan_mode", False):
+            return None
+        if not settings.get("knowledge_rag.force_search_knowledge", True):
+            return None
+        if not self._is_tool_available("AskKnowledge"):
+            return None
+
+        latest_index, query = self._latest_human_query(messages)
+        if latest_index < 0 or not query:
+            return None
+        if self._tool_used_after(messages, latest_index, {"AskKnowledge", "SearchKnowledge"}):
+            return None
+        if not self._looks_like_knowledge_question(query):
+            return None
+
+        tool_call_id = f"forced_askknowledge_{int(time.time() * 1000)}"
+        logger.info("资料问题强制首跳 AskKnowledge: %s", query[:120])
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "AskKnowledge",
+                "args": {"query": query, "top_k": 6},
+                "id": tool_call_id,
+            }],
+        )
+
     def _is_search_code_available(self) -> bool:
         """检查 SearchCode 是否已注册且本轮未被禁用。"""
-        if "SearchCode" in getattr(self, "_tool_unavailable_reasons", {}):
+        return self._is_tool_available("SearchCode")
+
+    def _is_tool_available(self, tool_name: str) -> bool:
+        """检查工具是否已注册且本轮未被禁用。"""
+        if tool_name in getattr(self, "_tool_unavailable_reasons", {}):
             return False
-        if "SearchCode" in getattr(self, "_disabled_tools", {}):
+        if tool_name in getattr(self, "_disabled_tools", {}):
             return False
         try:
-            return self.tool_registry.get("SearchCode") is not None
+            return self.tool_registry.get(tool_name) is not None
         except Exception:
             return False
 
@@ -381,12 +413,17 @@ class AgentLoop:
     @staticmethod
     def _search_code_used_after(messages: list, index: int) -> bool:
         """最近用户消息之后是否已经调用过 SearchCode。"""
+        return AgentLoop._tool_used_after(messages, index, {"SearchCode"})
+
+    @staticmethod
+    def _tool_used_after(messages: list, index: int, tool_names: set[str]) -> bool:
+        """最近用户消息之后是否已经调用过指定工具。"""
         for msg in messages[index + 1:]:
             if isinstance(msg, AIMessage):
                 for tool_call in getattr(msg, "tool_calls", []) or []:
-                    if tool_call.get("name") == "SearchCode":
+                    if tool_call.get("name") in tool_names:
                         return True
-            if isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "SearchCode":
+            if isinstance(msg, ToolMessage) and getattr(msg, "name", None) in tool_names:
                 return True
         return False
 
@@ -414,6 +451,27 @@ class AgentLoop:
         has_intent = any(term in text for term in implementation_terms)
         has_codebase_cue = any(cue in text for cue in codebase_cues)
         return has_intent and has_codebase_cue
+
+    @staticmethod
+    def _looks_like_knowledge_question(query: str) -> bool:
+        """启发式判断是否为用户资料/企业知识库问题。"""
+        text = (query or "").lower()
+        if re.search(r"https?://", text):
+            return False
+
+        knowledge_cues = (
+            "上传", "资料", "知识库", "文档", "文件", "pdf", "word", "docx",
+            "合同", "制度", "手册", "规范", "政策", "条款", "报告", "简历",
+            "这份", "这篇", "里面说", "文中", "材料", "附件", "图片",
+            "knowledge", "document", "uploaded", "attachment", "file",
+            "manual", "policy", "contract", "report",
+        )
+        question_terms = (
+            "是什么", "有哪些", "说明", "总结", "概括", "提取", "查找",
+            "检索", "引用", "依据", "出处", "第几页", "怎么规定",
+            "what", "which", "summarize", "find", "search", "cite",
+        )
+        return any(cue in text for cue in knowledge_cues) and any(term in text for term in question_terms)
 
     def _build_graph(self) -> StateGraph:
         """构建 LangGraph 状态图。"""
@@ -493,6 +551,10 @@ class AgentLoop:
         # 自动压缩检查（在 LLM 调用前）
         if self.compactor.should_compact(messages):
             messages = self.compactor.compact(messages)
+
+        forced_search = self._maybe_force_search_knowledge(messages)
+        if forced_search:
+            return {"messages": [forced_search]}
 
         forced_search = self._maybe_force_search_code(messages)
         if forced_search:
@@ -822,6 +884,13 @@ class AgentLoop:
             # "那它在哪里调用" into a code-searchable query. Existing callers can
             # still pass chat_history explicitly; this only fills the blank.
             if tool_name == "SearchCode" and isinstance(tool_args, dict) and not tool_args.get("chat_history"):
+                history = self._format_recent_chat_history(state["messages"][:-1])
+                if history:
+                    tool_args = dict(tool_args)
+                    tool_args["chat_history"] = history
+
+            # Same contextual help for knowledge RAG tools.
+            if tool_name in ("SearchKnowledge", "AskKnowledge") and isinstance(tool_args, dict) and not tool_args.get("chat_history"):
                 history = self._format_recent_chat_history(state["messages"][:-1])
                 if history:
                     tool_args = dict(tool_args)

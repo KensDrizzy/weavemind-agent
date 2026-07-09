@@ -36,7 +36,8 @@ _MCP_SAFE_KEYWORDS = {
 _BUILTIN_SAFE_TOOLS = {
     "Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUser",
     "MemoryAdd", "MemorySearch", "CoreMemoryEdit",
-    "SearchCode", "IndexWorkspace", "Task",
+    "SearchCode", "IndexWorkspace", "SearchKnowledge", "AskKnowledge",
+    "IndexKnowledge", "ListKnowledge", "ReindexKnowledge", "Task",
 }
 
 # 危险等级定义

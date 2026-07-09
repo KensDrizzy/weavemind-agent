@@ -177,6 +177,21 @@ class TestAgentLoop:
         loop.tool_registry = FakeRegistry()
         return loop
 
+    def _make_loop_for_searchknowledge(self, has_tool=True):
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.force_plan_mode = False
+        loop._tool_unavailable_reasons = {}
+        loop._disabled_tools = {}
+
+        class FakeRegistry:
+            def get(self, name):
+                if name == "AskKnowledge" and has_tool:
+                    return object()
+                return None
+
+        loop.tool_registry = FakeRegistry()
+        return loop
+
     def test_force_search_code_for_codebase_question(self):
         loop = self._make_loop_for_searchcode()
         messages = [HumanMessage(content="解释一下 weavemind 的 mcp 实现")]
@@ -215,6 +230,24 @@ class TestAgentLoop:
         messages = [HumanMessage(content="解释一下 weavemind 的 mcp 实现")]
 
         assert loop._maybe_force_search_code(messages) is None
+
+    def test_force_search_knowledge_for_document_question(self, monkeypatch):
+        monkeypatch.setattr("settings.get", lambda key, default=None: default)
+        loop = self._make_loop_for_searchknowledge()
+        messages = [HumanMessage(content="这份合同文档里关于终止条款是怎么规定的？")]
+
+        forced = loop._maybe_force_search_knowledge(messages)
+
+        assert forced is not None
+        assert forced.tool_calls[0]["name"] == "AskKnowledge"
+        assert forced.tool_calls[0]["args"]["query"] == "这份合同文档里关于终止条款是怎么规定的？"
+
+    def test_force_search_knowledge_skips_when_unregistered(self, monkeypatch):
+        monkeypatch.setattr("settings.get", lambda key, default=None: default)
+        loop = self._make_loop_for_searchknowledge(has_tool=False)
+        messages = [HumanMessage(content="这份制度文档有哪些审批要求？")]
+
+        assert loop._maybe_force_search_knowledge(messages) is None
 
     def test_should_continue_force_plan_stops_after_plan_ready(self):
         loop = AgentLoop.__new__(AgentLoop)

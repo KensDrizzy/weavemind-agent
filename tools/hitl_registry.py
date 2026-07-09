@@ -19,8 +19,13 @@ class HitlToolRegistry(ToolRegistry):
     """带 HITL 审批的工具注册表。"""
 
     def __init__(self, hitl_handler: Optional[TerminalHitlHandler] = None,
-                 memory_manager=None, rag_pipeline=None, mcp_manager=None):
-        super().__init__(memory_manager=memory_manager, rag_pipeline=rag_pipeline, mcp_manager=mcp_manager)
+                 memory_manager=None, rag_pipeline=None, knowledge_pipeline=None, mcp_manager=None):
+        super().__init__(
+            memory_manager=memory_manager,
+            rag_pipeline=rag_pipeline,
+            knowledge_pipeline=knowledge_pipeline,
+            mcp_manager=mcp_manager,
+        )
         self.hitl_handler = hitl_handler
 
     def check_approval(self, tool_name: str, tool_args: dict) -> Optional[ApprovalResult]:

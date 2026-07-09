@@ -391,6 +391,94 @@ class TestMultiAgentOrchestrator:
 
         assert orchestrator._select_worker_tools("搜索今天的 AI 新闻并总结") is None
 
+    def test_external_project_query_does_not_trigger_local_code_mode(self):
+        """开源项目/API 文档这类外部资料任务不应被“项目/代码”误判成本地代码任务。"""
+        mock_llm = self._make_mock_llm()
+        mock_registry = MagicMock()
+        mock_registry.get.return_value = object()
+        mock_registry.get_langchain_tools.return_value = []
+
+        orchestrator = MultiAgentOrchestrator(
+            llm=mock_llm,
+            tool_registry=mock_registry,
+        )
+
+        assert orchestrator._select_worker_tools("搜索某个开源项目的 API 文档和代码示例") is None
+
+    def test_local_repo_alias_with_code_intent_triggers_local_code_mode(self):
+        """当前仓库名加代码意图仍应进入本地代码模式。"""
+        mock_llm = self._make_mock_llm()
+        available = {"SearchCode", "Read", "Glob", "Grep"}
+        mock_registry = MagicMock()
+        mock_registry.get.side_effect = lambda name: object() if name in available else None
+        mock_registry.get_langchain_tools.return_value = []
+
+        orchestrator = MultiAgentOrchestrator(
+            llm=mock_llm,
+            tool_registry=mock_registry,
+        )
+
+        tools = orchestrator._select_worker_tools("分析一下 weavemind 的代码结构")
+
+        assert tools == ["SearchCode", "Read", "Glob", "Grep"]
+
+    def test_reuses_graph_when_worker_tool_signature_is_unchanged(self):
+        """连续同类任务不应重复构建 LangGraph。"""
+        mock_llm = self._make_mock_llm()
+        available = {"SearchCode", "Read", "Glob", "Grep"}
+        mock_registry = MagicMock()
+        mock_registry.get.side_effect = lambda name: object() if name in available else None
+        mock_registry.get_langchain_tools.return_value = []
+
+        orchestrator = MultiAgentOrchestrator(
+            llm=mock_llm,
+            tool_registry=mock_registry,
+        )
+
+        with patch("agents.orchestrator.create_worker_node", return_value=lambda state: {}):
+            with patch.object(orchestrator, "_build_graph", wraps=orchestrator._build_graph) as build_graph:
+                orchestrator._configure_graph_for_task("分析一下 weavemind 的代码结构")
+                orchestrator._configure_graph_for_task("检索一下 weavemind 的实现逻辑")
+
+        assert build_graph.call_count == 1
+
+    def test_reuses_initial_graph_for_unrestricted_task(self):
+        """初始图已经是普通工具集，普通任务不应先额外重建一次。"""
+        mock_llm = self._make_mock_llm()
+        mock_registry = MagicMock()
+        mock_registry.get.return_value = object()
+        mock_registry.get_langchain_tools.return_value = []
+
+        orchestrator = MultiAgentOrchestrator(
+            llm=mock_llm,
+            tool_registry=mock_registry,
+        )
+
+        with patch.object(orchestrator, "_build_graph", wraps=orchestrator._build_graph) as build_graph:
+            orchestrator._configure_graph_for_task("搜索今天的 AI 新闻并总结")
+
+        assert build_graph.call_count == 0
+
+    def test_rebuilds_graph_when_worker_tool_signature_changes(self):
+        """从普通任务切到本地代码任务时需要重建图以注入新的工具白名单。"""
+        mock_llm = self._make_mock_llm()
+        available = {"SearchCode", "Read", "Glob", "Grep"}
+        mock_registry = MagicMock()
+        mock_registry.get.side_effect = lambda name: object() if name in available else None
+        mock_registry.get_langchain_tools.return_value = []
+
+        orchestrator = MultiAgentOrchestrator(
+            llm=mock_llm,
+            tool_registry=mock_registry,
+        )
+        orchestrator._configure_graph_for_task("搜索今天的 AI 新闻并总结")
+
+        with patch("agents.orchestrator.create_worker_node", return_value=lambda state: {}):
+            with patch.object(orchestrator, "_build_graph", wraps=orchestrator._build_graph) as build_graph:
+                orchestrator._configure_graph_for_task("分析一下 weavemind 的代码结构")
+
+        assert build_graph.call_count == 1
+
     def test_local_code_task_adds_planner_local_repo_rules(self):
         """本地代码任务的 planner 也必须被约束，不能规划公网同名项目检索。"""
         mock_llm = self._make_mock_llm([MagicMock(content="1. 使用 SearchCode 检索本地 agents/")])

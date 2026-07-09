@@ -84,6 +84,15 @@ class WeaveMindCLI:
             except Exception as e:
                 logger.warning(f"RAG Pipeline 初始化失败: {e}")
 
+        self.knowledge_pipeline = None
+        if settings.get("knowledge_rag.enabled", False):
+            try:
+                from knowledge_rag.pipeline import KnowledgeRAGPipeline
+                self.knowledge_pipeline = KnowledgeRAGPipeline()
+                logger.info("Knowledge RAG Pipeline 已初始化")
+            except Exception as e:
+                logger.warning(f"Knowledge RAG Pipeline 初始化失败: {e}")
+
         # 初始化 MCP Manager（异步初始化在 run() 中执行）
         self.mcp_manager = MCPManager()
         self._mcp_initialized = False
@@ -101,7 +110,7 @@ class WeaveMindCLI:
         # 创建命令补全器
         commands = [
             "/help", "/memory", "/save", "/sessions", "/mode", "/plan", "/team",
-            "/hitl", "/mcp", "/browser", "/skill", "/index", "/search", "/clear", "/exit", "/quit"
+            "/hitl", "/mcp", "/browser", "/skill", "/index", "/search", "/kb", "/clear", "/exit", "/quit"
         ]
         completer = FuzzyCompleter(WordCompleter(commands, ignore_case=True))
         key_bindings = self._build_key_bindings()
@@ -162,6 +171,7 @@ class WeaveMindCLI:
             hitl_handler=self.hitl_handler,
             memory_manager=self.memory,
             rag_pipeline=self.rag_pipeline,
+            knowledge_pipeline=self.knowledge_pipeline,
             mcp_manager=self.mcp_manager if self._mcp_initialized else None,
         )
         # 注册 load_skill 工具
@@ -359,7 +369,14 @@ class WeaveMindCLI:
 
                 # 斜杠命令
                 if user_input.startswith("/"):
-                    result = handle_command(user_input, self.agent_loop, self.session_manager, rag_pipeline=self.rag_pipeline, mcp_manager=self.mcp_manager)
+                    result = handle_command(
+                        user_input,
+                        self.agent_loop,
+                        self.session_manager,
+                        rag_pipeline=self.rag_pipeline,
+                        knowledge_pipeline=self.knowledge_pipeline,
+                        mcp_manager=self.mcp_manager,
+                    )
 
                     if result == "plan_mode":
                         self.plan_mode = not self.plan_mode

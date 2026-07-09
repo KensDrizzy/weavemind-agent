@@ -80,11 +80,23 @@ LOCAL_CODE_PLANNER_RULES = (
     "- 只有用户明确要求外部资料、官方文档、最新信息时，才允许规划联网搜索。\n"
 )
 
-LOCAL_CODE_TASK_KEYWORDS = (
-    "代码", "代码库", "项目", "当前项目", "本地", "实现", "类", "函数", "方法",
-    "模块", "架构", "逻辑", "subagent", "multi-agent", "weavemind",
-    "code", "repo", "repository", "project", "implementation", "class",
-    "function", "method", "module",
+LOCAL_CODE_LOCAL_MARKERS = (
+    "本地", "当前", "当前项目", "当前代码库", "当前仓库", "这个项目", "这个代码库",
+    "这个仓库", "本项目", "本仓库", "工作目录", "代码库", "仓库",
+    "local", "current", "cwd", "repo", "repository", "workspace",
+)
+
+LOCAL_CODE_INTENT_TERMS = (
+    "代码", "源码", "实现", "类", "函数", "方法", "模块", "架构", "逻辑",
+    "流程", "机制", "调用", "依赖", "入口", "文件", "目录", "subagent",
+    "multi-agent", "class", "function", "method", "module", "implementation",
+    "architecture", "source", "code",
+)
+
+EXTERNAL_INFO_TERMS = (
+    "官网", "官方文档", "api文档", "api 文档", "文档", "最新", "release",
+    "releases", "版本", "开源项目", "github", "gitlab", "互联网", "网上",
+    "搜索引擎", "web", "online",
 )
 
 LOCAL_CODE_WORKER_TOOLS = [
@@ -319,6 +331,8 @@ class MultiAgentOrchestrator:
         self.hook_manager = hook_manager
         self.memory = memory
         self.num_workers = num_workers
+        self._current_worker_tool_names: list[str] | None = None
+        self._graph_tool_signature: tuple[str, ...] = tuple()
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
@@ -364,12 +378,34 @@ class MultiAgentOrchestrator:
 
     @property
     def _worker_tool_names(self) -> list[str] | None:
-        return getattr(self, "_current_worker_tool_names", None)
+        return self._current_worker_tool_names
+
+    def _repo_aliases(self) -> tuple[str, ...]:
+        repo_name = os.path.basename(os.getcwd()).lower()
+        aliases = {repo_name}
+        if repo_name.endswith("-agent"):
+            aliases.add(repo_name[:-6])
+        return tuple(alias for alias in aliases if alias)
+
+    def _is_local_code_task(self, user_input: str) -> bool:
+        """Heuristic local-code intent detection with external-info exclusions."""
+        lowered = user_input.lower()
+        has_code_intent = any(term.lower() in lowered for term in LOCAL_CODE_INTENT_TERMS)
+        if not has_code_intent:
+            return False
+
+        has_local_marker = any(term.lower() in lowered for term in LOCAL_CODE_LOCAL_MARKERS)
+        has_repo_alias = any(alias in lowered for alias in self._repo_aliases())
+        wants_external_info = any(term.lower() in lowered for term in EXTERNAL_INFO_TERMS)
+
+        if wants_external_info and not has_local_marker:
+            return False
+
+        return has_local_marker or has_repo_alias
 
     def _select_worker_tools(self, user_input: str) -> list[str] | None:
         """Restrict worker tools for local code tasks so they cannot drift to the web."""
-        lowered = user_input.lower()
-        if not any(keyword.lower() in lowered for keyword in LOCAL_CODE_TASK_KEYWORDS):
+        if not self._is_local_code_task(user_input):
             return None
 
         available = []
@@ -377,6 +413,18 @@ class MultiAgentOrchestrator:
             if self.tool_registry.get(name):
                 available.append(name)
         return available or None
+
+    def _configure_graph_for_task(self, user_input: str):
+        """Rebuild the LangGraph only when the worker tool set changes."""
+        selected_tools = self._select_worker_tools(user_input)
+        signature = tuple(selected_tools or ())
+        if signature == self._graph_tool_signature:
+            self._current_worker_tool_names = selected_tools
+            return
+
+        self._current_worker_tool_names = selected_tools
+        self._graph_tool_signature = signature
+        self.graph = self._build_graph()
 
     def _make_planner_node(self):
         """创建 Planner 节点：分析任务并输出执行计划。"""
@@ -415,8 +463,7 @@ class MultiAgentOrchestrator:
         Returns:
             最终状态字典
         """
-        self._current_worker_tool_names = self._select_worker_tools(user_input)
-        self.graph = self._build_graph()
+        self._configure_graph_for_task(user_input)
 
         initial_state = {
             "messages": [HumanMessage(content=user_input)],
@@ -432,8 +479,7 @@ class MultiAgentOrchestrator:
 
     def stream(self, user_input: str):
         """流式执行 Multi-Agent 协作，yield 每步状态。"""
-        self._current_worker_tool_names = self._select_worker_tools(user_input)
-        self.graph = self._build_graph()
+        self._configure_graph_for_task(user_input)
 
         initial_state = {
             "messages": [HumanMessage(content=user_input)],

@@ -14,15 +14,30 @@ from tools.builtin.web_fetch import WebFetchTool
 from tools.builtin.ask_user import AskUserTool
 from tools.builtin.memory_tools import MemoryAddTool, MemorySearchTool, CoreMemoryEditTool
 from tools.builtin.rag_tools import SearchCodeTool, IndexWorkspaceTool
+from tools.builtin.knowledge_tools import (
+    AskKnowledgeTool,
+    DeleteKnowledgeTool,
+    IndexKnowledgeTool,
+    ListKnowledgeTool,
+    ReindexKnowledgeTool,
+    SearchKnowledgeTool,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
-    def __init__(self, memory_manager=None, rag_pipeline=None, mcp_manager=None):
+    def __init__(
+        self,
+        memory_manager=None,
+        rag_pipeline=None,
+        knowledge_pipeline=None,
+        mcp_manager=None,
+    ):
         self._tools: dict = {}
         self._memory_manager = memory_manager
         self._rag_pipeline = rag_pipeline
+        self._knowledge_pipeline = knowledge_pipeline
         self._mcp_manager = mcp_manager
         self._mcp_tools_registered = False
         self._register_builtins()
@@ -39,6 +54,20 @@ class ToolRegistry:
             tools_list.append(SearchCodeTool(rag_pipeline=self._rag_pipeline))
             tools_list.append(IndexWorkspaceTool(rag_pipeline=self._rag_pipeline))
             logger.info("RAG 工具已注册: SearchCode, IndexWorkspace")
+
+        if settings.get("knowledge_rag.enabled", False) and self._knowledge_pipeline:
+            tools_list.extend([
+                SearchKnowledgeTool(knowledge_pipeline=self._knowledge_pipeline),
+                AskKnowledgeTool(knowledge_pipeline=self._knowledge_pipeline),
+                IndexKnowledgeTool(knowledge_pipeline=self._knowledge_pipeline),
+                ListKnowledgeTool(knowledge_pipeline=self._knowledge_pipeline),
+                DeleteKnowledgeTool(knowledge_pipeline=self._knowledge_pipeline),
+                ReindexKnowledgeTool(knowledge_pipeline=self._knowledge_pipeline),
+            ])
+            logger.info(
+                "Knowledge RAG 工具已注册: SearchKnowledge, AskKnowledge, "
+                "IndexKnowledge, ListKnowledge, DeleteKnowledge, ReindexKnowledge"
+            )
 
         # 读取/检索类工具
         tools_list.extend([
