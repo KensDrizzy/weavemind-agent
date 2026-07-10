@@ -16,6 +16,7 @@ import base64
 import logging
 import os
 import time
+from core.multimodal.content_part import ImageBase64Part
 from pathlib import Path
 from typing import Any
 
@@ -79,8 +80,8 @@ def _extract_text_items(result: Any) -> list[dict]:
 
 # ── 截图格式化 ─────────────────────────────────────────────────
 
-def _format_screenshot(items: list[dict]) -> str:
-    """格式化截图结果：base64 保存为文件，返回文件路径。"""
+def _format_screenshot(items: list[dict], image_parts_out: list | None = None) -> str:
+    """格式化截图结果：base64 保存为文件，返回文件路径；同时收集图片供 LLM 消费。"""
     for item in items:
         if item["type"] == "image":
             data = item["data"]
@@ -96,6 +97,8 @@ def _format_screenshot(items: list[dict]) -> str:
             try:
                 raw = base64.b64decode(data)
                 filepath.write_bytes(raw)
+                if image_parts_out is not None:
+                    image_parts_out.append(ImageBase64Part(data=data, mime_type=mime))
                 return f"[截图已保存: {filepath}] ({len(raw)} bytes, {mime})"
             except Exception as e:
                 logger.warning("截图保存失败: %s", e)
@@ -151,14 +154,18 @@ def _format_performance(items: list[dict]) -> str:
     return _truncate_text(combined, max_len=4000)
 
 
-def _format_generic_chrome(items: list[dict]) -> str:
+def _format_generic_chrome(items: list[dict], image_parts_out: list | None = None) -> str:
     """通用 Chrome 工具结果格式化。"""
     parts = []
     for item in items:
         if item["type"] == "text":
             parts.append(item["text"])
         elif item["type"] == "image":
-            parts.append(f"[图片数据: {item.get('mime_type', 'unknown')}]")
+            data = item.get("data", "")
+            mime = item.get("mime_type", "unknown")
+            if image_parts_out is not None and data:
+                image_parts_out.append(ImageBase64Part(data=data, mime_type=mime))
+            parts.append(f"[图片数据: {mime}]")
         elif item["type"] == "resource":
             parts.append(f"[资源: {item.get('uri', 'unknown')}]")
 
@@ -182,12 +189,13 @@ _FORMATTERS = {
 
 # ── 公共入口 ──────────────────────────────────────────────────
 
-def format_chrome_result(tool_name: str, result: Any) -> str:
+def format_chrome_result(tool_name: str, result: Any, image_parts_out: list | None = None) -> str:
     """格式化 Chrome DevTools MCP 工具的返回结果。
 
     Args:
         tool_name: 工具名（如 take_screenshot, navigate_page 等）
         result: MCP 工具返回的 CallToolResult 对象
+        image_parts_out: 可选，用于收集图片 base64 供 LLM 消费
 
     Returns:
         str: 格式化后的结果字符串
@@ -203,4 +211,4 @@ def format_chrome_result(tool_name: str, result: Any) -> str:
 
     # 选择格式化器
     formatter = _FORMATTERS.get(tool_name, _format_generic_chrome)
-    return formatter(items)
+    return formatter(items, image_parts_out)

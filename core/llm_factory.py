@@ -2,7 +2,7 @@
 
 支持两种模式：
 - Anthropic 原生端点 → ChatAnthropic
-- OpenAI 兼容端点（MiMo、DeepSeek 等）→ ChatOpenAI / MiMoChatOpenAI
+- OpenAI 兼容端点（MiMo、DeepSeek、Moonshot 等）→ ChatOpenAI / MiMoChatOpenAI
 """
 
 import logging
@@ -11,11 +11,12 @@ from typing import Optional
 from langchain_openai import ChatOpenAI
 
 import settings
+from core.multimodal.model_capabilities import supports_vision
 
 logger = logging.getLogger(__name__)
 
 # 已知使用 OpenAI 兼容端点的 provider
-OPENAI_COMPAT_PROVIDERS = {"mimo", "deepseek", "openai"}
+OPENAI_COMPAT_PROVIDERS = {"mimo", "deepseek", "openai", "moonshot"}
 
 
 def create_llm(provider: str = None, model: str = None, max_tokens: int = 4096):
@@ -41,6 +42,13 @@ def create_llm(provider: str = None, model: str = None, max_tokens: int = 4096):
 
     # 确定使用的模型
     use_model = model or default_model or cfg_model
+
+    # 若当前模型支持 vision 且 provider 配置了 vision 专用 endpoint，则切换
+    if supports_vision(use_model):
+        vision_base_url = provider_cfg.get("vision_base_url", "")
+        if vision_base_url:
+            base_url = vision_base_url
+            logger.info(f"模型 {use_model} 支持 vision，使用 vision endpoint: {base_url}")
 
     # 判断走 OpenAI 兼容还是 Anthropic 原生
     if cfg_provider.lower() in OPENAI_COMPAT_PROVIDERS or "/v1" in base_url:

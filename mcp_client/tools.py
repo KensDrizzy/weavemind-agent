@@ -13,6 +13,8 @@ from typing import Any, Optional, Type
 from pydantic import BaseModel, Field, create_model
 
 from mcp.types import Tool as MCPToolInfo
+from core.audit import log_image_load
+from core.multimodal.content_part import ImageBase64Part
 from tools.base import WeaveMindTool
 
 logger = logging.getLogger(__name__)
@@ -124,8 +126,8 @@ def _detect_login_hint(result_str: str) -> str:
     return ""
 
 
-def _format_result(result: Any) -> str:
-    """将 MCP 工具返回结果格式化为字符串。"""
+def _format_result(result: Any, image_parts_out: list | None = None) -> str:
+    """将 MCP 工具返回结果格式化为字符串，并可选收集图片 base64。"""
     is_error = getattr(result, "isError", False)
     content = getattr(result, "content", [])
 
@@ -146,6 +148,9 @@ def _format_result(result: Any) -> str:
             texts.append(getattr(item, "text", ""))
         elif item_type == "image":
             mime = getattr(item, "mimeType", "unknown")
+            data = getattr(item, "data", "")
+            if image_parts_out is not None and data:
+                image_parts_out.append(ImageBase64Part(data=data, mime_type=mime))
             texts.append(f"[图片数据: {mime}]")
         elif item_type == "resource":
             resource = getattr(item, "resource", None)
@@ -183,10 +188,10 @@ def create_mcp_tool_instance(
         conn.server_type == "chrome" and is_chrome_tool(tname)
     )
 
-    def _format(result: Any) -> str:
+    def _format(result: Any, image_parts_out: list | None = None) -> str:
         if use_chrome_formatter:
-            return format_chrome_result(tname, result)
-        return _format_result(result)
+            return format_chrome_result(tname, result, image_parts_out)
+        return _format_result(result, image_parts_out)
 
     # 创建同步调用函数
     def sync_func(**kwargs) -> str:
@@ -209,7 +214,19 @@ def create_mcp_tool_instance(
                 # 无持久循环（测试等场景）
                 result = asyncio.run(conn.call_tool(tname, filtered_kwargs))
 
-            result_str = _format(result)
+            image_parts: list = []
+            result_str = _format(result, image_parts)
+            if image_parts:
+                result_str.image_parts = image_parts  # type: ignore[attr-defined]
+                for part in image_parts:
+                    size_bytes = len(part.data) * 3 // 4
+                    log_image_load(
+                        source_type="mcp",
+                        mime_type=part.mime_type,
+                        size_bytes=size_bytes,
+                        success=True,
+                        extra={"tool_name": tname},
+                    )
 
             # 执行后更新 BrowserGuard 状态
             if use_chrome_formatter and mcp_manager:
@@ -226,7 +243,19 @@ def create_mcp_tool_instance(
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
             result = await conn.call_tool(tname, filtered_kwargs)
-            result_str = _format(result)
+            image_parts: list = []
+            result_str = _format(result, image_parts)
+            if image_parts:
+                result_str.image_parts = image_parts  # type: ignore[attr-defined]
+                for part in image_parts:
+                    size_bytes = len(part.data) * 3 // 4
+                    log_image_load(
+                        source_type="mcp",
+                        mime_type=part.mime_type,
+                        size_bytes=size_bytes,
+                        success=True,
+                        extra={"tool_name": tname},
+                    )
             if use_chrome_formatter and mcp_manager:
                 mcp_manager.apply_browser_after_execution(
                     tname, filtered_kwargs, result_str

@@ -18,6 +18,11 @@ providers:
     api_key_env: MIMO_API_KEY
     default_model: mimo-v2.5-pro
 
+  moonshot:
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: MOONSHOT_API_KEY
+    default_model: kimi-k2.7
+
 memory:
   project_file: .weavemind/MEMORY.md
   claude_md: CLAUDE.md
@@ -30,6 +35,21 @@ memory:
 session:
   storage_dir: .weavemind/sessions
   compaction_threshold: 80000
+
+multimodal:
+  enabled: true
+  max_image_file_size: 20971520       # 20MB
+  allowed_mime_types: ["image/png", "image/jpeg", "image/webp", "image/gif"]
+  allowed_image_dirs: []
+  clipboard:
+    enabled: true
+    timeout_seconds: 8
+  image_pruning:
+    keep_last_n_rounds: 1
+
+audit:
+  enabled: true
+  dir: .weavemind/audit
 
 permissions:
   default_mode: default
