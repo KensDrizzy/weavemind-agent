@@ -30,6 +30,13 @@ from core.compaction import ContextCompactor
 from core.cancellation import AgentCancelledError, CancellationToken
 from core.llm_factory import create_llm
 from core.memory import MemoryManager
+from core.multimodal.content_part import content_to_text, parts_to_openai
+from core.multimodal.image_pruner import prune_historical_image_payloads
+from core.multimodal.model_capabilities import (
+    message_has_image,
+    messages_have_image,
+    require_vision_model,
+)
 from core.plan_models import Plan
 from core.planner import Planner
 from core.plan_executor import PlanExecutor
@@ -535,7 +542,7 @@ class AgentLoop:
             query = ""
             for m in reversed(messages):
                 if isinstance(m, HumanMessage):
-                    query = m.content[:100]
+                    query = content_to_text(m.content)[:100]
                     break
 
             # 构建 system message（含 CLAUDE.md + MEMORY.md + skill 索引）
@@ -553,9 +560,13 @@ class AgentLoop:
             if drained:
                 for i in range(len(messages) - 1, -1, -1):
                     if isinstance(messages[i], HumanMessage):
-                        original = messages[i].content
-                        messages[i] = HumanMessage(content=drained + "用户输入：\n" + original)
+                        original_text = content_to_text(messages[i].content)
+                        messages[i] = HumanMessage(content=drained + "用户输入：\n" + original_text)
                         break
+
+        # 历史图片裁剪：在压缩和 LLM 调用前移除旧图片 payload
+        keep_rounds = settings.get("multimodal.image_pruning.keep_last_n_rounds", 1)
+        messages = prune_historical_image_payloads(list(messages), keep_last_n_rounds=keep_rounds)
 
         # 自动压缩检查（在 LLM 调用前）
         if self.compactor.should_compact(messages):
@@ -612,6 +623,13 @@ class AgentLoop:
                 )
                 if not has_hint:
                     messages.append(SystemMessage(content=browser_hint))
+
+        # 多模态能力检查：消息含图片但模型不支持 vision 时快速失败
+        if messages_have_image(messages):
+            try:
+                require_vision_model(self.model)
+            except ValueError as e:
+                return {"messages": [AIMessage(content=f"[系统错误] {e}")]}
 
         self._model_call_count += 1
         call_index = self._model_call_count
@@ -1116,6 +1134,19 @@ class AgentLoop:
                 name=tool_name,
             ))
 
+            # MCP / Chrome 工具返回图片时，把图片作为 user message 注入
+            # tool role 不支持 content array，必须用 user message 承载图片
+            image_parts = getattr(result, "image_parts", None)
+            if image_parts:
+                image_content = [
+                    {
+                        "type": "text",
+                        "text": f"工具 {tool_name} 返回了图片内容，请结合上面的工具文本结果分析。",
+                    }
+                ]
+                image_content.extend(parts_to_openai(image_parts))
+                tool_messages.append(HumanMessage(content=image_content))
+
         return {"messages": tool_messages}
 
     def _refresh_tools_after_browser_switch(self):
@@ -1143,7 +1174,7 @@ class AgentLoop:
         user_messages = [
             m for m in state["messages"] if isinstance(m, HumanMessage)
         ]
-        goal = user_messages[-1].content if user_messages else ""
+        goal = content_to_text(user_messages[-1].content) if user_messages else ""
 
         if self.hook_manager:
             self.hook_manager.emit("PlanStart", {

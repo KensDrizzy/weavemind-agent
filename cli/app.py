@@ -29,6 +29,10 @@ from permissions.policy import PermissionPolicy
 from tools.hitl_registry import HitlToolRegistry
 from core.session import SessionManager
 from mcp_client.manager import MCPManager
+from core.multimodal.image_loader import capture_clipboard_image, load_image_parts
+from core.multimodal.image_reference import ImageRef, parse_image_refs, replace_image_refs, strip_image_refs
+from core.multimodal.message_builder import build_multimodal_message
+from core.multimodal.content_part import ImageBase64Part
 import settings
 
 console = Console()
@@ -106,6 +110,8 @@ class WeaveMindCLI:
         self._ctrl_c_count = 0
         self._ctrl_c_window = 1.0  # 双击时间窗口（秒）
         self._has_shown_rag_hint = False  # 是否已显示 RAG 提示
+        self._pending_clipboard_parts: list[ImageBase64Part] = []  # 热键预捕获的剪贴板图片
+        self._has_shown_image_privacy_hint = False  # 是否已显示图片隐私提示
 
         # 创建命令补全器
         commands = [
@@ -145,6 +151,30 @@ class WeaveMindCLI:
             self.stream_renderer.set_expanded(self.stream_details_expanded)
             status = "展开" if self.stream_details_expanded else "收起"
             console.print(f"\n[dim]流式详情已{status}[/dim]")
+
+        @bindings.add("f5")
+        def _paste_clipboard_image(event):
+            """F5 捕获剪贴板图片并插入 @clipboard 标记。"""
+            if not self._has_shown_image_privacy_hint:
+                console.print("\n[yellow]提示：图片将上传至当前 LLM provider。[/yellow]")
+                self._has_shown_image_privacy_hint = True
+
+            try:
+                processed = capture_clipboard_image()
+            except Exception as e:
+                console.print(f"\n[red]剪贴板图片捕获失败: {e}[/red]")
+                return
+
+            part = ImageBase64Part(data=processed.data, mime_type=processed.mime_type)
+            self._pending_clipboard_parts.append(part)
+
+            buffer = event.app.current_buffer
+            buffer.insert_text(" @clipboard ")
+            size = len(processed.data) * 3 // 4
+            console.print(
+                f"\n[dim][已插入剪贴板图片: {processed.mime_type}, "
+                f"{processed.width}x{processed.height}, base64≈{size} bytes][/dim]"
+            )
 
         return bindings
 
@@ -280,7 +310,9 @@ class WeaveMindCLI:
         import settings
         if not settings.get("team.auto_detect", True):
             return False
-        complexity = self.agent_loop.classify_complexity(user_input)
+        # 去掉图片引用，避免分类模型被 @image 标记干扰
+        clean_input = strip_image_refs(user_input)
+        complexity = self.agent_loop.classify_complexity(clean_input)
         logger.info(f"任务复杂度: {complexity}")
         return complexity == "complex"
 
@@ -442,6 +474,43 @@ class WeaveMindCLI:
                 logger.error(f"REPL 错误: {e}", exc_info=True)
                 console.print(f"\n[red]❌ 错误: {e}[/red]\n")
 
+    def _build_user_message(self, user_input: str):
+        """把用户输入解析为可能包含图片的 HumanMessage。"""
+        refs = parse_image_refs(user_input)
+        if not refs:
+            return HumanMessage(content=user_input)
+
+        image_parts: list[ImageBase64Part] = []
+        clipboard_refs = [r for r in refs if r.is_clipboard]
+        path_refs = [r for r in refs if not r.is_clipboard]
+
+        # 优先使用热键预捕获的剪贴板图片，避免提交时剪贴板内容已变
+        if clipboard_refs:
+            pending = self._pending_clipboard_parts
+            if pending:
+                for _ in clipboard_refs:
+                    if pending:
+                        image_parts.append(pending.pop(0))
+                if len(clipboard_refs) > len(image_parts):
+                    console.print(
+                        f"[yellow]警告：@{clipboard_refs[0].source} 引用数量超过预捕获图片数，"
+                        f"超出部分将实时重新捕获。[/yellow]"
+                    )
+            # 剩余未匹配的剪贴板引用仍实时捕获
+            remaining = len(clipboard_refs) - len(image_parts)
+            if remaining > 0:
+                image_parts.extend(load_image_parts(clipboard_refs[len(image_parts):]))
+
+        if path_refs:
+            image_parts.extend(load_image_parts(path_refs))
+
+        plain_text = replace_image_refs(user_input)
+        for part in image_parts:
+            mime = part.mime_type
+            size = len(part.data) * 3 // 4  # 粗略字节数
+            console.print(f"[dim][已附加图片: {mime}, base64≈{size} bytes][/dim]")
+        return build_multimodal_message(plain_text, image_parts)
+
     def _run_agent(self, user_input: str):
         """执行 Agent 循环并渲染输出。"""
         # 手动 /team 优先
@@ -484,8 +553,8 @@ class WeaveMindCLI:
                 console.print()
             self._has_shown_rag_hint = True  # 只提示一次
 
-        # 将用户输入加入对话历史
-        self.conversation.append(HumanMessage(content=user_input))
+        # 将用户输入加入对话历史（支持图片）
+        self.conversation.append(self._build_user_message(user_input))
 
         self._compact_conversation_history()
 

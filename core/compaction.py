@@ -15,6 +15,8 @@ import logging
 
 import settings
 import tiktoken
+from core.multimodal.content_part import content_to_text
+from core.multimodal.image_pruner import prune_historical_image_payloads
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 logger = logging.getLogger(__name__)
@@ -35,9 +37,24 @@ class ContextCompactor:
         """计算消息列表的总 token 数。"""
         total = 0
         for m in messages:
-            content = m.content if hasattr(m, "content") else str(m)
-            if content:
-                total += len(self._enc.encode(content))
+            content = getattr(m, "content", None)
+            text = content_to_text(content)
+            if text:
+                total += len(self._enc.encode(text))
+        return total
+
+    def count_image_payloads(self, messages: list) -> int:
+        """估算消息列表中图片 base64 的字符数。"""
+        total = 0
+        for m in messages:
+            content = getattr(m, "content", None)
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    url = block.get("image_url", {}).get("url", "")
+                    if url.startswith("data:") and ";base64," in url:
+                        total += len(url.split(";base64,", 1)[1])
         return total
 
     def should_compact(self, messages: list) -> bool:
@@ -70,6 +87,9 @@ class ContextCompactor:
 
         old_msgs = chat_msgs[:-retain_count]
         recent_msgs = chat_msgs[-retain_count:]
+
+        # 压缩前先把旧消息中的图片 payload 清掉，避免摘要模型看到 base64
+        old_msgs = prune_historical_image_payloads(old_msgs, keep_last_n_rounds=0)
 
         # 1. 先提取关键事实到长期记忆
         if self.memory_manager:
@@ -177,17 +197,19 @@ class ContextCompactor:
         """格式化消息列表为可读文本。"""
         parts = []
         for m in messages:
+            text = content_to_text(getattr(m, "content", None))
             if isinstance(m, HumanMessage):
-                parts.append(f"用户: {m.content}")
+                parts.append(f"用户: {text}")
             elif isinstance(m, AIMessage):
-                if m.content:
-                    parts.append(f"助手: {m.content}")
+                if text:
+                    parts.append(f"助手: {text}")
                 if m.tool_calls:
                     for tc in m.tool_calls:
                         parts.append(f"  [调用工具] {tc['name']}({tc.get('args', {})})")
             elif isinstance(m, ToolMessage):
-                content = m.content
-                if len(content) > 200:
-                    content = content[:200] + "..."
-                parts.append(f"  [工具结果] {content}")
+                parts.append(f"工具结果: {text}")
+            elif isinstance(m, SystemMessage):
+                parts.append(f"系统: {text}")
+            else:
+                parts.append(f"其他: {text}")
         return "\n".join(parts)
