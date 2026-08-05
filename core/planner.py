@@ -115,7 +115,11 @@ class Planner:
             HumanMessage(content=f"请为以下目标制定执行计划：\n{goal}"),
         ]
 
-        response = self.llm.invoke(messages)
+        from core.llm_retry import call_with_retry
+        response = call_with_retry(
+            lambda: self.llm.invoke(messages),
+            description="计划生成",
+        )
         raw_content = response.content
 
         # 提取 JSON（LLM 可能包裹在 markdown code block 中）

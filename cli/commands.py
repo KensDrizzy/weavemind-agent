@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 
 from rich.console import Console
 from rich.panel import Panel
@@ -15,6 +16,11 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 
+def _fmt_tokens(n: int) -> str:
+    """16537 -> '16.5k'。"""
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
 def handle_command(
     cmd: str,
     agent_loop,
@@ -22,6 +28,7 @@ def handle_command(
     rag_pipeline=None,
     knowledge_pipeline=None,
     mcp_manager=None,
+    current_session_id=None,
 ) -> bool:
     """Returns True if command was handled, str for mode change, 'plan_mode' for /plan toggle."""
     parts = cmd.strip().split()
@@ -37,7 +44,8 @@ def handle_command(
         help_table.add_row("/index [目录]", "索引代码库（建立 RAG 检索数据库）")
         help_table.add_row("/search <关键词>", "手动检索代码库中的相关代码")
         help_table.add_row("/kb add/search/ask/list/delete/reindex", "管理和检索资料知识库")
-        help_table.add_row("/sessions", "列出所有保存的会话")
+        help_table.add_row("/sessions", "列出历史会话；/sessions <序号或ID前缀> 切换会话")
+        help_table.add_row("/new", "保存当前会话并开始新会话")
         help_table.add_row("/mode [MODE]", "切换权限模式 (default | acceptEdits | bypassPermissions)")
         help_table.add_row("/hitl [on|off|status]", "人工审批模式（默认启用，/hitl off 关闭）")
         help_table.add_row("/mcp [status|tools|health]", "查看 MCP 连接状态、工具列表、健康检查")
@@ -45,7 +53,7 @@ def handle_command(
         help_table.add_row("/skill [list|show|on|off|reload]", "管理 Skills（经验复用）")
         help_table.add_row("/plan", "切换 Plan-Execute 模式（复杂任务先规划后执行）")
         help_table.add_row("/team", "切换 Multi-Agent 模式（多角色分工+审查验收）")
-        help_table.add_row("/clear", "清空屏幕")
+        help_table.add_row("/clear", "清空屏幕并开始新会话（旧会话可从 /sessions 找回）")
         help_table.add_row("/exit 或 /quit", "退出 Agent")
 
         console.print()
@@ -59,17 +67,41 @@ def handle_command(
         _save_fact(parts)
 
     elif name == "/sessions":
+        # 带参数 → 切换会话（返回信号由 app.py 处理）
+        if len(parts) > 1:
+            return f"switch:{parts[1]}"
+
         sessions = session_manager.list()
         if not sessions:
             console.print("\n[dim]无保存的会话[/dim]\n")
         else:
-            session_table = Table(title="💾 保存的会话", show_header=False)
-            for i, sid in enumerate(sessions, 1):
-                session_table.add_row(f"{i}.", sid, style="dim")
+            session_table = Table(title="💾 会话列表", show_header=True, header_style="bold cyan")
+            session_table.add_column("#", style="dim", width=4)
+            session_table.add_column("ID", style="cyan", width=10)
+            session_table.add_column("更新时间", style="dim", width=14)
+            session_table.add_column("消息数", justify="right", width=6)
+            session_table.add_column("Σ tokens", justify="right", style="dim", width=10)
+            session_table.add_column("标题", style="white")
+            for i, s in enumerate(sessions, 1):
+                mark = "→ " if current_session_id and s["id"] == current_session_id else ""
+                updated = time.strftime("%m-%d %H:%M", time.localtime(s["updated_at"])) if s["updated_at"] else "-"
+                total = (s.get("token_totals") or {}).get("total", 0)
+                session_table.add_row(
+                    f"{mark}{i}",
+                    s["id"][:8],
+                    updated,
+                    str(s["message_count"]),
+                    _fmt_tokens(total),
+                    s["title"][:40],
+                )
 
             console.print()
             console.print(session_table)
+            console.print("[dim]切换会话: /sessions <序号或ID前缀> ｜ 新会话: /new[/dim]")
             console.print()
+
+    elif name == "/new":
+        return "new_session"
 
     elif name == "/mode":
         if len(parts) > 1:

@@ -47,6 +47,8 @@ class WeaveMindCLI:
         self.hook_manager = HookManager()
         self.memory = MemoryManager()
         self.session_manager = SessionManager()
+        self.session_id = self.session_manager.create()  # 每次启动开新会话
+        self.session_token_totals = {"input": 0, "output": 0, "total": 0}
         self.mode = PermissionMode.DEFAULT
         self.plan_mode = False
         self.team_mode = False
@@ -56,6 +58,7 @@ class WeaveMindCLI:
             rich_console=console,
             expanded=self.stream_details_expanded,
         )
+        self.stream_renderer.session_totals = self.session_token_totals
         self._register_stream_hooks()
 
         # HITL 人工审批处理器（默认启用）
@@ -101,6 +104,15 @@ class WeaveMindCLI:
         self.mcp_manager = MCPManager()
         self._mcp_initialized = False
 
+        # Checkpoint 持久化（长任务中断恢复：崩溃/超时后从最近 super-step 续跑）
+        self.checkpointer_provider = None
+        if settings.get("checkpoint.enabled", True):
+            try:
+                from core.checkpoint import CheckpointerProvider
+                self.checkpointer_provider = CheckpointerProvider()
+            except Exception as e:
+                logger.warning(f"Checkpoint 初始化失败（不影响主流程）: {e}")
+
         # 初始化 Skill 系统
         self._init_skills()
 
@@ -115,7 +127,7 @@ class WeaveMindCLI:
 
         # 创建命令补全器
         commands = [
-            "/help", "/memory", "/save", "/sessions", "/mode", "/plan", "/team",
+            "/help", "/memory", "/save", "/sessions", "/new", "/mode", "/plan", "/team",
             "/hitl", "/mcp", "/browser", "/skill", "/index", "/search", "/kb", "/clear", "/exit", "/quit"
         ]
         completer = FuzzyCompleter(WordCompleter(commands, ignore_case=True))
@@ -223,6 +235,7 @@ class WeaveMindCLI:
             mcp_manager=self.mcp_manager if self._mcp_initialized else None,
             skill_registry=self.skill_registry,
             skill_buffer=self.skill_buffer,
+            checkpointer_provider=self.checkpointer_provider,
         )
 
     def _init_mcp_sync(self):
@@ -375,6 +388,9 @@ class WeaveMindCLI:
             padding=(1, 2),
         ))
 
+        # 检测并恢复上次意外中断的任务
+        self._maybe_resume_interrupted()
+
         while True:
             try:
                 # 模式指示器
@@ -408,7 +424,16 @@ class WeaveMindCLI:
                         rag_pipeline=self.rag_pipeline,
                         knowledge_pipeline=self.knowledge_pipeline,
                         mcp_manager=self.mcp_manager,
+                        current_session_id=self.session_id,
                     )
+
+                    if isinstance(result, str) and result.startswith("switch:"):
+                        self._switch_session(result[len("switch:"):])
+                        continue
+
+                    if result == "new_session":
+                        self._new_session()
+                        continue
 
                     if result == "plan_mode":
                         self.plan_mode = not self.plan_mode
@@ -425,7 +450,11 @@ class WeaveMindCLI:
 
                     if result == "clear":
                         self.conversation.clear()
-                        console.print("[dim]对话历史已清空[/dim]")
+                        # /clear 同时开启新会话，旧会话已落盘可从 /sessions 找回
+                        self.session_id = self.session_manager.create()
+                        self.session_token_totals.clear()
+                        self.session_token_totals.update({"input": 0, "output": 0, "total": 0})
+                        console.print("[dim]对话历史已清空（已开始新会话，旧会话可用 /sessions 找回）[/dim]")
                         continue
 
                     if isinstance(result, str) and result in [
@@ -563,30 +592,9 @@ class WeaveMindCLI:
 
         try:
             # 使用对话历史调用 Agent
-            final_ai_message = None
-            for event in self.agent_loop.stream_with_history(self.conversation):
-                for node_name, state in event.items():
-                    if state is None or not isinstance(state, dict):
-                        continue
-
-                    if node_name == "plan" and self.stream_details_expanded:
-                        plan_dict = state.get("plan")
-                        if plan_dict:
-                            plan = Plan.model_validate(plan_dict)
-                            print_plan_created(plan)
-
-                    elif node_name == "execute_plan" and self.stream_details_expanded:
-                        plan_dict = state.get("plan")
-                        if plan_dict:
-                            plan = Plan.model_validate(plan_dict)
-                            print_plan_progress(plan)
-                            print_plan_result(plan)
-
-                    messages = state.get("messages", [])
-                    if messages:
-                        for msg in messages:
-                            if isinstance(msg, AIMessage) and not msg.tool_calls:
-                                final_ai_message = msg
+            final_ai_message = self._consume_agent_events(
+                self.agent_loop.stream_with_history(self.conversation)
+            )
 
             if final_ai_message:
                 # 检查是否为空响应
@@ -607,15 +615,137 @@ class WeaveMindCLI:
             logger.error(f"Agent 执行错误: {e}", exc_info=True)
             console.print(f"\n[red]❌ 执行错误: {e}[/red]\n")
         finally:
+            self._accumulate_session_tokens()
             self.stream_renderer.finish()
-            # 保存会话状态
-            try:
-                self.session_manager.save(
-                    self.session_manager.create(),
-                    {"message_count": len(self.conversation)},
-                )
-            except Exception:
-                pass  # 会话保存失败不影响主流程
+            self._save_current_session()
+
+    def _accumulate_session_tokens(self):
+        """把本轮 token 计数累加进会话级统计。"""
+        totals = getattr(self, "session_token_totals", None)
+        if totals is None:
+            return
+        turn = self.stream_renderer.turn_tokens
+        for k in totals:
+            totals[k] += turn.get(k, 0)
+
+    def _save_current_session(self):
+        """把当前会话完整落盘（每轮结束后调用）。"""
+        session_id = getattr(self, "session_id", None)
+        if not session_id:
+            return
+        try:
+            self.session_manager.save(
+                session_id, self.conversation, self.session_token_totals
+            )
+        except Exception as e:
+            logger.warning("会话保存失败: %s", e)
+
+    def _switch_session(self, arg: str):
+        """切换到历史会话：保存当前 → 加载目标 → 替换 conversation。"""
+        target_id = self.session_manager.resolve(arg)
+        if not target_id:
+            console.print(f"\n[red]❌ 找不到会话: {arg}[/red]（用 /sessions 查看列表）\n")
+            return
+        if target_id == self.session_id:
+            console.print("\n[dim]已在该会话中[/dim]\n")
+            return
+
+        self._save_current_session()
+        messages, meta = self.session_manager.resume(target_id)
+        if messages is None:
+            console.print(f"\n[red]❌ 会话 {target_id[:8]} 加载失败[/red]\n")
+            return
+
+        self.session_id = target_id
+        self.conversation = list(messages)
+        totals = meta.get("token_totals") or {}
+        self.session_token_totals.clear()
+        self.session_token_totals.update({
+            "input": totals.get("input", 0),
+            "output": totals.get("output", 0),
+            "total": totals.get("total", 0),
+        })
+        console.print(
+            f"\n[cyan]🔀 已切换到会话 {target_id[:8]}[/cyan] "
+            f"[dim]{meta.get('title', '')}（{len(self.conversation)} 条消息）[/dim]\n"
+        )
+
+    def _new_session(self):
+        """保存当前会话并开始新会话。"""
+        self._save_current_session()
+        self.session_id = self.session_manager.create()
+        self.conversation.clear()
+        self.session_token_totals.clear()
+        self.session_token_totals.update({"input": 0, "output": 0, "total": 0})
+        console.print(f"\n[cyan]✨ 已开始新会话（id: {self.session_id[:8]}）[/cyan]\n")
+
+    def _consume_agent_events(self, events):
+        """消费 Agent 事件流：渲染 plan 细节并跟踪最终 AI 消息。"""
+        final_ai_message = None
+        for event in events:
+            for node_name, state in event.items():
+                if state is None or not isinstance(state, dict):
+                    continue
+
+                if node_name == "plan" and self.stream_details_expanded:
+                    plan_dict = state.get("plan")
+                    if plan_dict:
+                        plan = Plan.model_validate(plan_dict)
+                        print_plan_created(plan)
+
+                elif node_name == "execute_plan" and self.stream_details_expanded:
+                    plan_dict = state.get("plan")
+                    if plan_dict:
+                        plan = Plan.model_validate(plan_dict)
+                        print_plan_progress(plan)
+                        print_plan_result(plan)
+
+                messages = state.get("messages", [])
+                if messages:
+                    for msg in messages:
+                        if isinstance(msg, AIMessage) and not msg.tool_calls:
+                            final_ai_message = msg
+        return final_ai_message
+
+    def _maybe_resume_interrupted(self):
+        """启动时检测上次意外中断的运行，提示用户从中断点恢复。"""
+        provider = getattr(self.agent_loop, "checkpointer_provider", None)
+        if provider is None:
+            return
+        thread_id = provider.active_thread()
+        if not thread_id:
+            return
+
+        console.print(
+            f"\n[yellow]⚠ 检测到上次任务意外中断（thread: {thread_id[:8]}…）[/yellow]"
+        )
+        choice = console.input("是否从中断点恢复执行？[y/N] ").strip().lower()
+        if choice != "y":
+            provider.clear_active()
+            console.print("[dim]已放弃恢复，中断标记已清除[/dim]\n")
+            return
+
+        console.print("[dim]正在从最近的 checkpoint 恢复执行…[/dim]")
+        self.stream_renderer.reset(expanded=self.stream_details_expanded)
+        self.stream_renderer.start()
+        try:
+            final_ai_message = self._consume_agent_events(
+                self.agent_loop.resume(thread_id)
+            )
+            if final_ai_message:
+                content = getattr(final_ai_message, "content", "")
+                if content and content.strip():
+                    console.print(f"\n🤖 {content}")
+            # 恢复完成后把 checkpoint 中该轮的消息合并回会话历史，保持后续对话连贯
+            restored = self.agent_loop.get_thread_messages(thread_id)
+            if restored:
+                self.conversation.extend(restored)
+                self._compact_conversation_history()
+        except Exception as e:
+            logger.error(f"恢复执行失败: {e}", exc_info=True)
+            console.print(f"\n[red]❌ 恢复执行失败: {e}[/red]\n")
+        finally:
+            self.stream_renderer.finish()
 
     def _compact_conversation_history(self):
         """对话历史过长时先压缩，再用滑动窗口兜底裁剪。

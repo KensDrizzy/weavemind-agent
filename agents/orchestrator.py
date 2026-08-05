@@ -324,6 +324,7 @@ class MultiAgentOrchestrator:
         hook_manager=None,
         memory=None,
         num_workers: int = 2,
+        checkpointer=None,
     ):
         self.llm = llm
         self.tool_registry = tool_registry
@@ -331,6 +332,7 @@ class MultiAgentOrchestrator:
         self.hook_manager = hook_manager
         self.memory = memory
         self.num_workers = num_workers
+        self.checkpointer = checkpointer
         self._current_worker_tool_names: list[str] | None = None
         self._graph_tool_signature: tuple[str, ...] = tuple()
         self.graph = self._build_graph()
@@ -374,7 +376,7 @@ class MultiAgentOrchestrator:
         # 5. 入口 → Supervisor
         builder.add_edge(START, "supervisor")
 
-        return builder.compile()
+        return builder.compile(checkpointer=self.checkpointer)
 
     @property
     def _worker_tool_names(self) -> list[str] | None:
@@ -474,6 +476,7 @@ class MultiAgentOrchestrator:
             "retry_count": 0,
         }
         config = {"recursion_limit": MAX_SUPERVISOR_ROUNDS * 5}
+        config.update(self._checkpoint_config())
         result = self.graph.invoke(initial_state, config=config)
         return result
 
@@ -490,5 +493,17 @@ class MultiAgentOrchestrator:
             "retry_count": 0,
         }
         config = {"recursion_limit": MAX_SUPERVISOR_ROUNDS * 5}
+        config.update(self._checkpoint_config())
         for event in self.graph.stream(initial_state, config=config):
             yield event
+
+    def _checkpoint_config(self) -> dict:
+        """启用 checkpointer 时为每次运行生成 thread_id（每次运行独立 thread）。
+
+        仅提供 checkpoint 落盘能力；跨进程恢复由 AgentLoop 的
+        resume() 机制负责，Team 模式的恢复入口待后续补齐。
+        """
+        if self.checkpointer is None:
+            return {}
+        import uuid
+        return {"configurable": {"thread_id": uuid.uuid4().hex}}

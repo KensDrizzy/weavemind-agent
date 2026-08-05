@@ -36,6 +36,19 @@ session:
   storage_dir: .weavemind/sessions
   compaction_threshold: 80000
 
+# 长任务中断恢复：LangGraph checkpoint 持久化 + thread 标记 + 任务级执行记录
+checkpoint:
+  enabled: true
+  sqlite_path: .weavemind/checkpoints.sqlite3
+  active_thread_path: .weavemind/active_thread.json
+  task_records_path: .weavemind/task_records.sqlite3
+
+# MCP 配置（servers 需按需另行配置）
+mcp:
+  # 浏览器工具按需挂载：chrome 页面操作工具默认不绑定给 LLM，
+  # 检测到浏览器意图时才挂载（每次调用省数千 tokens）；false = 始终挂载
+  lazy_browser_tools: true
+
 multimodal:
   enabled: true
   max_image_file_size: 20971520       # 20MB

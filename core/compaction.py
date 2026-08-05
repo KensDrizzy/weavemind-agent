@@ -122,7 +122,11 @@ class ContextCompactor:
             f"{conversation}"
         )
         try:
-            response = self.llm.invoke([SystemMessage(content=prompt)])
+            from core.llm_retry import call_with_retry
+            response = call_with_retry(
+                lambda: self.llm.invoke([SystemMessage(content=prompt)]),
+                description="摘要生成",
+            )
             return response.content
         except Exception as e:
             logger.warning(f"摘要生成失败: {e}")
@@ -156,7 +160,11 @@ class ContextCompactor:
             f"{combined}"
         )
         try:
-            response = self.llm.invoke([SystemMessage(content=prompt)])
+            from core.llm_retry import call_with_retry
+            response = call_with_retry(
+                lambda: self.llm.invoke([SystemMessage(content=prompt)]),
+                description="合并摘要",
+            )
             return response.content
         except Exception as e:
             logger.warning(f"合并摘要失败: {e}")
@@ -178,7 +186,11 @@ class ContextCompactor:
             f"{conversation}"
         )
         try:
-            response = self.llm.invoke([SystemMessage(content=prompt)])
+            from core.llm_retry import call_with_retry
+            response = call_with_retry(
+                lambda: self.llm.invoke([SystemMessage(content=prompt)]),
+                description="事实提取",
+            )
             facts_text = response.content.strip()
             if facts_text and facts_text != "无":
                 count = 0

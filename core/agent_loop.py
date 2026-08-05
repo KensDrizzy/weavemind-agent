@@ -84,6 +84,7 @@ class AgentLoop:
         skill_registry=None,
         skill_buffer=None,
         cancellation_token: Optional[CancellationToken] = None,
+        checkpointer_provider=None,
     ):
         self.tool_registry = tool_registry
         self.permission_policy = permission_policy
@@ -96,25 +97,40 @@ class AgentLoop:
         self.skill_registry = skill_registry
         self.skill_buffer = skill_buffer
         self.cancellation_token = cancellation_token
+        self.checkpointer_provider = checkpointer_provider
         self.mode = "default"
+        self._current_thread_id = None  # 当前 checkpoint 运行的 thread_id（_act 记录作用域）
         self._model_call_count = 0
         self._tool_unavailable_reasons: dict[str, str] = {}
         self._tool_failure_counts: dict[str, int] = {}
         self._disabled_tools: dict[str, str] = {}
 
         self.llm = create_llm(provider, model)
-        self.tools = self._filter_available_tools(tool_registry.get_langchain_tools())
+        self._browser_tools_mounted = False
+        self._all_available_tools = self._filter_available_tools(
+            tool_registry.get_langchain_tools()
+        )
+        self.tools = self._apply_browser_tool_filter(self._all_available_tools)
         self.llm_with_tools = self.llm.bind_tools(self.tools)
 
         # 上下文压缩器（在 LLM 初始化之后创建，因为需要 LLM 做摘要）
         self.compactor = ContextCompactor(llm=self.llm, memory_manager=self.memory)
 
         self.planner = Planner(provider, model)
+
+        # 任务级执行记录：plan 节点内部中断后重入时跳过已完成任务（副作用幂等）。
+        # 仅在启用 checkpoint 时创建——没有 checkpoint 就没有恢复入口，记录无意义。
+        task_store = None
+        if checkpointer_provider is not None:
+            from core.task_records import TaskRecordStore
+            task_store = TaskRecordStore()
+        self.task_store = task_store
         self.plan_executor = PlanExecutor(
             tool_registry=tool_registry,
             permission_policy=permission_policy,
             hook_manager=hook_manager,
             cancellation_token=cancellation_token,
+            task_store=task_store,
         )
 
         self.graph = self._build_graph()
@@ -151,6 +167,74 @@ class AgentLoop:
             if not provider.is_ready():
                 return False, "无可用搜索引擎（需配置 TAVILY_API_KEY、SEARXNG_URL 或安装 duckduckgo-search）"
         return True, ""
+
+    # ── 浏览器工具按需挂载 ──────────────────────────────
+
+    _BROWSER_INTENT_RE = re.compile(
+        r"https?://|浏览器|网页|网站|页面|截图|抓取网页|点击|登录|"
+        r"browse|browser|chrome|webpage|screenshot|navigate",
+        re.IGNORECASE,
+    )
+
+    def _apply_browser_tool_filter(self, tools: list) -> list:
+        """未挂载时从 LLM 绑定列表过滤 chrome 页面操作工具（每次调用省数千 tokens）。
+
+        只影响 LLM 可见的工具列表；_act 执行走 ToolRegistry 不受影响。
+        browser_connect/disconnect/status 三个控制工具不在过滤范围，始终可用。
+        """
+        if getattr(self, "_browser_tools_mounted", False):
+            return tools
+        if not settings.get("mcp.lazy_browser_tools", True):
+            return tools
+        from mcp_client.chrome_formatter import is_chrome_tool
+        filtered = [t for t in tools if not is_chrome_tool(getattr(t, "name", ""))]
+        removed = len(tools) - len(filtered)
+        if removed:
+            logger.info(
+                "浏览器工具按需挂载：暂时隐藏 %d 个 chrome 工具（检测到浏览器意图时自动挂载）",
+                removed,
+            )
+        return filtered
+
+    def _maybe_mount_browser_tools(self, messages: list):
+        """检测到浏览器意图或 shared 模式激活时，把 chrome 工具挂进 LLM 绑定。
+
+        挂载是单向的（本进程内不再卸下），避免轮次间反复重绑。
+        """
+        if getattr(self, "_browser_tools_mounted", False):
+            return
+        if not settings.get("mcp.lazy_browser_tools", True):
+            return
+        from mcp_client.chrome_formatter import is_chrome_tool
+        all_tools = getattr(self, "_all_available_tools", None) or getattr(self, "tools", [])
+        chrome_tools = [
+            t for t in all_tools
+            if is_chrome_tool(getattr(t, "name", ""))
+        ]
+        if not chrome_tools:
+            return
+
+        should_mount = False
+        mcp_manager = getattr(self, "mcp_manager", None)
+        if (
+            mcp_manager
+            and getattr(mcp_manager, "_chrome_server_name", None)
+            and mcp_manager.get_chrome_mode() == "shared"
+        ):
+            should_mount = True
+        else:
+            for m in reversed(messages):
+                if isinstance(m, HumanMessage):
+                    if self._BROWSER_INTENT_RE.search(content_to_text(m.content)):
+                        should_mount = True
+                    break
+
+        if not should_mount:
+            return
+        self._browser_tools_mounted = True
+        self.tools = list(all_tools)
+        self.llm_with_tools = self.llm.bind_tools(self.tools)
+        logger.info("检测到浏览器意图，已挂载 %d 个 chrome 工具", len(chrome_tools))
 
     # ── MiMo reasoning_content 回传支持 ──────────────────────────
 
@@ -323,12 +407,72 @@ class AgentLoop:
 
     def _inject_stop_message(self, messages: list, reason: str):
         """注入停止指令。"""
-        logger.warning("检测到浏览器循环（%s），注入停止指令", reason)
+        logger.warning("检测到工具调用循环（%s），注入停止指令", reason)
         messages.append(SystemMessage(content=(
-            "[系统中断] 你已经陷入重复的浏览器操作循环。\n"
-            "请立即停止所有浏览器工具调用，根据已获取的内容进行总结回复用户。\n"
-            "不要再调用 take_screenshot、take_snapshot 或 evaluate_script。"
+            "[系统中断] 你已经陷入重复的工具调用循环。\n"
+            "请立即停止重复调用工具，根据已获取的内容进行总结回复用户。"
         )))
+
+    # 通用停滞检测参数
+    _STAGNATION_WINDOW = 8      # 检查最近 N 个 tool_call
+    _STAGNATION_THRESHOLD = 3   # 写类工具：相同签名连续出现即判循环
+    _STAGNATION_RELAXED_THRESHOLD = 5  # 读类工具放宽（多文件查看是合法行为）
+    _STAGNATION_RELAXED_TOOLS = frozenset({
+        "Read", "Glob", "Grep", "SearchCode", "SearchKnowledge",
+        "AskKnowledge", "WebSearch", "WebFetch", "MemorySearch",
+    })
+
+    def _detect_stagnation(self, messages: list) -> bool:
+        """通用停滞检测：同一 (工具名+参数) 签名连续重复调用，判定为死循环。
+
+        写类/命令类工具（Bash/Edit/Write 等）连续 3 次相同签名触发；
+        读类工具放宽到 5 次。触发后注入停止指令。
+        """
+        import hashlib
+        import json as _json
+
+        signatures = []
+        for m in reversed(messages):
+            if isinstance(m, AIMessage) and m.tool_calls:
+                for tc in reversed(m.tool_calls):
+                    try:
+                        args_key = _json.dumps(
+                            tc.get("args", {}), sort_keys=True,
+                            ensure_ascii=False, default=str,
+                        )
+                    except (TypeError, ValueError):
+                        args_key = str(tc.get("args", {}))
+                    digest = hashlib.md5(args_key.encode()).hexdigest()[:12]
+                    signatures.append(f"{tc.get('name', '')}:{digest}")
+                    if len(signatures) >= self._STAGNATION_WINDOW:
+                        break
+            if len(signatures) >= self._STAGNATION_WINDOW:
+                break
+
+        if len(signatures) < self._STAGNATION_THRESHOLD:
+            return False
+
+        # 从最新往前数连续相同签名的次数
+        latest = signatures[0]
+        streak = 0
+        for sig in signatures:
+            if sig == latest:
+                streak += 1
+            else:
+                break
+
+        tool_name = latest.split(":", 1)[0]
+        threshold = (
+            self._STAGNATION_RELAXED_THRESHOLD
+            if tool_name in self._STAGNATION_RELAXED_TOOLS
+            else self._STAGNATION_THRESHOLD
+        )
+        if streak >= threshold:
+            self._inject_stop_message(
+                messages, f"工具 {tool_name} 相同参数连续调用 {streak} 次"
+            )
+            return True
+        return False
 
     def _maybe_force_search_code(self, messages: list) -> Optional[AIMessage]:
         """对代码库实现类问题强制首跳 SearchCode。
@@ -520,7 +664,10 @@ class AgentLoop:
         # Plan-Execute 一次执行即结束，避免进入下一轮 think 产生重复/矛盾输出
         graph.add_edge("execute_plan", END)
 
-        return graph.compile()
+        checkpointer = (
+            self.checkpointer_provider.saver if self.checkpointer_provider else None
+        )
+        return graph.compile(checkpointer=checkpointer)
 
     # ── 节点实现 ──────────────────────────────────────────
 
@@ -563,6 +710,9 @@ class AgentLoop:
                         original_text = content_to_text(messages[i].content)
                         messages[i] = HumanMessage(content=drained + "用户输入：\n" + original_text)
                         break
+
+        # 浏览器工具按需挂载：检测到浏览器意图时把 chrome 工具加入 LLM 绑定
+        self._maybe_mount_browser_tools(messages)
 
         # 历史图片裁剪：在压缩和 LLM 调用前移除旧图片 payload
         keep_rounds = settings.get("multimodal.image_pruning.keep_last_n_rounds", 1)
@@ -649,10 +799,12 @@ class AgentLoop:
 
         # MiMo 模型禁用了 streaming（_stream 为空生成器），直接走 invoke 避免无效尝试
         from core.llm_factory import MiMoChatOpenAI
+        from core.llm_retry import call_with_retry, compute_delay, is_retryable
         skip_stream = isinstance(getattr(self, "llm", None), MiMoChatOpenAI)
 
         if not skip_stream:
-            try:
+            def _consume_stream():
+                nonlocal full_chunk, emitted_any_delta
                 for chunk in self.llm_with_tools.stream(messages):
                     self._check_cancelled()
                     full_chunk = chunk if full_chunk is None else full_chunk + chunk
@@ -664,22 +816,51 @@ class AgentLoop:
                             "call_index": call_index,
                             "delta": delta_text,
                         })
-            except AgentCancelledError:
-                raise
-            except Exception as e:
-                stream_failed = True
-                logger.debug(f"LLM stream 失败，回退 invoke: {e}")
+
+            for attempt in (1, 2):
+                try:
+                    _consume_stream()
+                    stream_failed = False
+                    break
+                except AgentCancelledError:
+                    raise
+                except Exception as e:
+                    stream_failed = True
+                    # 只有未输出过任何内容时才可安全重试整个流
+                    # （已吐字后重放会让用户看到重复内容）
+                    if attempt == 1 and not emitted_any_delta and is_retryable(e):
+                        delay = compute_delay(1, e)
+                        logger.warning(
+                            "LLM stream 失败（可重试）：%s；%.1fs 后重试", e, delay
+                        )
+                        self._check_cancelled()
+                        time.sleep(delay)
+                        full_chunk = None  # 丢弃不完整累积，重新消费
+                        continue
+                    logger.debug(f"LLM stream 失败，回退 invoke: {e}")
+                    break
 
         if full_chunk is None or stream_failed:
             self._check_cancelled()
-            response = self.llm_with_tools.invoke(messages)
-            if self.hook_manager and not emitted_any_delta:
+            response = call_with_retry(
+                lambda: self.llm_with_tools.invoke(messages),
+                description="LLM invoke",
+            )
+            if self.hook_manager:
                 response_text = self._extract_text_content(getattr(response, "content", ""))
                 if response_text:
-                    self.hook_manager.emit("LLMDelta", {
-                        "call_index": call_index,
-                        "delta": response_text,
-                    })
+                    if emitted_any_delta:
+                        # 流式中途断开：用户只看到了部分内容，
+                        # 补发完整回答（允许少量重复，好过只看到半截）
+                        self.hook_manager.emit("LLMDelta", {
+                            "call_index": call_index,
+                            "delta": "\n（流式中断，以下为完整回答）\n" + response_text,
+                        })
+                    else:
+                        self.hook_manager.emit("LLMDelta", {
+                            "call_index": call_index,
+                            "delta": response_text,
+                        })
         else:
             response = message_chunk_to_message(full_chunk)
 
@@ -828,6 +1009,9 @@ class AgentLoop:
         # 浏览器工具重复检测（防止无限滚动/截图循环）
         if self._detect_browser_loop(state["messages"]):
             return "end"
+        # 通用停滞检测（同一工具签名连续重复调用）
+        if self._detect_stagnation(state["messages"]):
+            return "end"
         # 普通模式：有 tool_calls 则继续
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
             return "continue"
@@ -894,7 +1078,12 @@ class AgentLoop:
         return "\n".join(lines[-max_messages:])
 
     def _act(self, state: AgentState) -> dict:
-        """执行工具调用。"""
+        """执行工具调用。
+
+        中断恢复：启用 checkpoint 时，每个 tool_call 的结果以
+        (act:{thread_id}, tool_call_id) 为键写入执行记录；节点重跑时
+        已有记录的 tool_call 直接回放结果，不重复执行工具（副作用幂等）。
+        """
         self._check_cancelled()
         last_message = state["messages"][-1]
         if not isinstance(last_message, AIMessage):
@@ -904,209 +1093,252 @@ class AgentLoop:
         tool_messages = []
         for tool_call in last_message.tool_calls:
             self._check_cancelled()
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
 
-            # Give SearchCode enough context to rewrite follow-up questions like
-            # "那它在哪里调用" into a code-searchable query. Existing callers can
-            # still pass chat_history explicitly; this only fills the blank.
-            if tool_name == "SearchCode" and isinstance(tool_args, dict) and not tool_args.get("chat_history"):
-                history = self._format_recent_chat_history(state["messages"][:-1])
-                if history:
-                    tool_args = dict(tool_args)
-                    tool_args["chat_history"] = history
+            # 中断恢复重入：该 tool_call 已有执行记录 → 回放结果，不重复执行
+            record_key = self._tool_call_record_key(tool_call)
+            if record_key:
+                record = self.task_store.get(*record_key)
+                if record and record["status"] == "completed":
+                    logger.info(
+                        "tool_call %s (%s) 已有执行记录，回放结果（中断恢复）",
+                        tool_call["id"], tool_call["name"],
+                    )
+                    tool_messages.append(ToolMessage(
+                        content=record["result"] or "",
+                        tool_call_id=tool_call["id"],
+                        name=tool_call["name"],
+                    ))
+                    continue
 
-            # Same contextual help for knowledge RAG tools.
-            if tool_name in ("SearchKnowledge", "AskKnowledge") and isinstance(tool_args, dict) and not tool_args.get("chat_history"):
-                history = self._format_recent_chat_history(state["messages"][:-1])
-                if history:
-                    tool_args = dict(tool_args)
-                    tool_args["chat_history"] = history
+            before = len(tool_messages)
+            try:
+                self._run_tool_call(state, tool_call, tool_messages)
+            finally:
+                self._save_tool_call_record(record_key, tool_messages[before:])
 
-            # 运行环境不可用：直接返回可解释错误，避免模型反复重试
-            unavailable_reason = self._tool_unavailable_reasons.get(tool_name)
-            if unavailable_reason:
-                error_text = (
-                    f"工具 {tool_name} 当前不可用：{unavailable_reason}。"
-                    "请不要再次调用该工具，改用其他工具或直接向用户说明。"
+        return {"messages": tool_messages}
+
+    def _tool_call_record_key(self, tool_call):
+        """返回 tool_call 执行记录的 (scope, key)；未启用 checkpoint 时返回 None。"""
+        store = getattr(self, "task_store", None)
+        thread_id = getattr(self, "_current_thread_id", None)
+        call_id = tool_call.get("id")
+        if store is None or not thread_id or not call_id:
+            return None
+        return (f"act:{thread_id}", call_id)
+
+    def _save_tool_call_record(self, record_key, new_messages):
+        """把一次 tool_call 的最终 ToolMessage 内容写入执行记录。
+
+        取消/中断导致没有产出 ToolMessage 时不写记录，
+        恢复后该 tool_call 会重新执行。
+        """
+        if not record_key:
+            return
+        from langchain_core.messages import ToolMessage
+        for msg in new_messages:
+            if isinstance(msg, ToolMessage):
+                self.task_store.upsert(
+                    record_key[0], record_key[1], "completed",
+                    result=str(msg.content),
                 )
-                if self.hook_manager:
-                    self.hook_manager.emit("PostToolUse", {
-                        "tool": tool_name,
-                        "args": tool_args,
-                        "result": error_text,
-                        "error": True,
-                    })
-                tool_messages.append(ToolMessage(
-                    content=error_text,
-                    tool_call_id=tool_call["id"],
-                ))
-                continue
+                return
 
-            # 本轮已达到失败阈值：短路并阻止继续重试
-            disabled_reason = self._disabled_tools.get(tool_name)
-            if disabled_reason:
-                if self.hook_manager:
-                    self.hook_manager.emit("PostToolUse", {
-                        "tool": tool_name,
-                        "args": tool_args,
-                        "result": disabled_reason,
-                        "error": True,
-                    })
-                tool_messages.append(ToolMessage(
-                    content=disabled_reason,
-                    tool_call_id=tool_call["id"],
-                ))
-                continue
+    def _run_tool_call(self, state: AgentState, tool_call: dict, tool_messages: list):
+        """执行单个 tool_call，把结果 ToolMessage 追加到 tool_messages。"""
+        from langchain_core.messages import ToolMessage
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
 
-            # 权限检查
-            if not self.permission_policy.is_allowed(tool_name):
-                error_text = f"工具 {tool_name} 被权限策略拒绝"
-                self._record_tool_failure(tool_name, error_text)
-                if self.hook_manager:
-                    self.hook_manager.emit("PostToolUse", {
-                        "tool": tool_name,
-                        "args": tool_args,
-                        "result": error_text,
-                        "error": True,
-                    })
-                tool_messages.append(ToolMessage(
-                    content=error_text,
-                    tool_call_id=tool_call["id"],
-                ))
-                continue
+        # Give SearchCode enough context to rewrite follow-up questions like
+        # "那它在哪里调用" into a code-searchable query. Existing callers can
+        # still pass chat_history explicitly; this only fills the blank.
+        if tool_name == "SearchCode" and isinstance(tool_args, dict) and not tool_args.get("chat_history"):
+            history = self._format_recent_chat_history(state["messages"][:-1])
+            if history:
+                tool_args = dict(tool_args)
+                tool_args["chat_history"] = history
 
-            # HITL 审批检查（完整审批流程，支持全部放行等高级功能）
-            # 如果 HITL 启用，使用 HITL 的审批流程；否则使用简单的确认流程
-            approval_result = self._check_hitl_approval(tool_name, tool_args)
-            if approval_result is not None:
-                # HITL 已处理审批，根据结果决定后续行为
-                if approval_result.decision.value == "rejected":
-                    reason = approval_result.reason or "用户拒绝了此操作"
-                    hitl_msg = f"[HITL] 操作已被拒绝：{reason}"
-                    if self.hook_manager:
-                        self.hook_manager.emit("PostToolUse", {
-                            "tool": tool_name,
-                            "args": tool_args,
-                            "result": hitl_msg,
-                            "error": True,
-                        })
-                    tool_messages.append(ToolMessage(
-                        content=hitl_msg,
-                        tool_call_id=tool_call["id"],
-                    ))
-                    continue
+        # Same contextual help for knowledge RAG tools.
+        if tool_name in ("SearchKnowledge", "AskKnowledge") and isinstance(tool_args, dict) and not tool_args.get("chat_history"):
+            history = self._format_recent_chat_history(state["messages"][:-1])
+            if history:
+                tool_args = dict(tool_args)
+                tool_args["chat_history"] = history
 
-                if approval_result.decision.value == "skipped":
-                    if self.hook_manager:
-                        self.hook_manager.emit("PostToolUse", {
-                            "tool": tool_name,
-                            "args": tool_args,
-                            "result": "[HITL] 操作已被跳过",
-                            "error": True,
-                        })
-                    tool_messages.append(ToolMessage(
-                        content="[HITL] 操作已被跳过",
-                        tool_call_id=tool_call["id"],
-                    ))
-                    continue
-
-                # 修改参数后执行
-                if approval_result.decision.value == "modified" and approval_result.modified_args:
-                    tool_args = approval_result.modified_args
-
-                # approved / approved_all 继续执行
-            elif self.mode == "default" and self.permission_policy.needs_confirmation(tool_name, "default"):
-                # HITL 未启用，使用简单的确认流程
-                from cli.hitl_renderer import render_approval_panel, render_choice_hint
-                from core.hitl_models import ApprovalRequest
-                from core.hitl_policy import get_danger_info
-                
-                danger_level, risk_description = get_danger_info(tool_name)
-                request = ApprovalRequest(
-                    tool_name=tool_name,
-                    arguments=tool_args,
-                    danger_level=danger_level,
-                    risk_description=risk_description,
-                )
-                
-                console.print()
-                console.print(render_approval_panel(request))
-                console.print(render_choice_hint())
-                console.print()
-                
-                user_input = console.input("[bold]> [/bold]").strip().lower()
-                
-                if user_input == "n":
-                    error_text = "[权限] 用户拒绝了此操作"
-                    if self.hook_manager:
-                        self.hook_manager.emit("PostToolUse", {
-                            "tool": tool_name,
-                            "args": tool_args,
-                            "result": error_text,
-                            "error": True,
-                        })
-                    tool_messages.append(ToolMessage(
-                        content=error_text,
-                        tool_call_id=tool_call["id"],
-                    ))
-                    continue
-                elif user_input == "s":
-                    skip_text = "[权限] 用户跳过了此操作"
-                    if self.hook_manager:
-                        self.hook_manager.emit("PostToolUse", {
-                            "tool": tool_name,
-                            "args": tool_args,
-                            "result": skip_text,
-                            "error": True,
-                        })
-                    tool_messages.append(ToolMessage(
-                        content=skip_text,
-                        tool_call_id=tool_call["id"],
-                    ))
-                    continue
-                # y 或其他 → 继续执行
-
-            # flush 渲染缓冲区，避免审批面板与流式输出混淆
+        # 运行环境不可用：直接返回可解释错误，避免模型反复重试
+        unavailable_reason = self._tool_unavailable_reasons.get(tool_name)
+        if unavailable_reason:
+            error_text = (
+                f"工具 {tool_name} 当前不可用：{unavailable_reason}。"
+                "请不要再次调用该工具，改用其他工具或直接向用户说明。"
+            )
             if self.hook_manager:
-                self.hook_manager.emit("BeforeToolExecution", {})
-
-            # PreToolUse Hook
-            if self.hook_manager:
-                self.hook_manager.emit("PreToolUse", {
+                self.hook_manager.emit("PostToolUse", {
                     "tool": tool_name,
                     "args": tool_args,
+                    "result": error_text,
+                    "error": True,
                 })
+            tool_messages.append(ToolMessage(
+                content=error_text,
+                tool_call_id=tool_call["id"],
+            ))
+            return
 
-            # 执行工具
-            had_error = False
-            tool = self.tool_registry.get(tool_name)
-            if tool:
-                try:
-                    self._check_cancelled()
-                    result = tool.invoke(tool_args)
-                    self._check_cancelled()
-                    self._tool_failure_counts[tool_name] = 0
-                except AgentCancelledError:
-                    raise
-                except Exception as e:
-                    had_error = True
-                    self._record_tool_failure(tool_name, str(e))
-                    result = f"工具执行错误: {e}"
-                    disabled_reason = self._disabled_tools.get(tool_name)
-                    if disabled_reason:
-                        result = f"{result}\n{disabled_reason}"
-                    if self.hook_manager:
-                        self.hook_manager.emit("PostToolUse", {
-                            "tool": tool_name,
-                            "args": tool_args,
-                            "result": str(result)[:500],
-                            "error": True,
-                        })
-            else:
+        # 本轮已达到失败阈值：短路并阻止继续重试
+        disabled_reason = self._disabled_tools.get(tool_name)
+        if disabled_reason:
+            if self.hook_manager:
+                self.hook_manager.emit("PostToolUse", {
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "result": disabled_reason,
+                    "error": True,
+                })
+            tool_messages.append(ToolMessage(
+                content=disabled_reason,
+                tool_call_id=tool_call["id"],
+            ))
+            return
+
+        # 权限检查
+        if not self.permission_policy.is_allowed(tool_name):
+            error_text = f"工具 {tool_name} 被权限策略拒绝"
+            self._record_tool_failure(tool_name, error_text)
+            if self.hook_manager:
+                self.hook_manager.emit("PostToolUse", {
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "result": error_text,
+                    "error": True,
+                })
+            tool_messages.append(ToolMessage(
+                content=error_text,
+                tool_call_id=tool_call["id"],
+            ))
+            return
+
+        # HITL 审批检查（完整审批流程，支持全部放行等高级功能）
+        # 如果 HITL 启用，使用 HITL 的审批流程；否则使用简单的确认流程
+        approval_result = self._check_hitl_approval(tool_name, tool_args)
+        if approval_result is not None:
+            # HITL 已处理审批，根据结果决定后续行为
+            if approval_result.decision.value == "rejected":
+                reason = approval_result.reason or "用户拒绝了此操作"
+                hitl_msg = f"[HITL] 操作已被拒绝：{reason}"
+                if self.hook_manager:
+                    self.hook_manager.emit("PostToolUse", {
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "result": hitl_msg,
+                        "error": True,
+                    })
+                tool_messages.append(ToolMessage(
+                    content=hitl_msg,
+                    tool_call_id=tool_call["id"],
+                ))
+                return
+
+            if approval_result.decision.value == "skipped":
+                if self.hook_manager:
+                    self.hook_manager.emit("PostToolUse", {
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "result": "[HITL] 操作已被跳过",
+                        "error": True,
+                    })
+                tool_messages.append(ToolMessage(
+                    content="[HITL] 操作已被跳过",
+                    tool_call_id=tool_call["id"],
+                ))
+                return
+
+            # 修改参数后执行
+            if approval_result.decision.value == "modified" and approval_result.modified_args:
+                tool_args = approval_result.modified_args
+
+            # approved / approved_all 继续执行
+        elif self.mode == "default" and self.permission_policy.needs_confirmation(tool_name, "default"):
+            # HITL 未启用，使用简单的确认流程
+            from cli.hitl_renderer import render_approval_panel, render_choice_hint
+            from core.hitl_models import ApprovalRequest
+            from core.hitl_policy import get_danger_info
+
+            danger_level, risk_description = get_danger_info(tool_name)
+            request = ApprovalRequest(
+                tool_name=tool_name,
+                arguments=tool_args,
+                danger_level=danger_level,
+                risk_description=risk_description,
+            )
+
+            console.print()
+            console.print(render_approval_panel(request))
+            console.print(render_choice_hint())
+            console.print()
+
+            user_input = console.input("[bold]> [/bold]").strip().lower()
+
+            if user_input == "n":
+                error_text = "[权限] 用户拒绝了此操作"
+                if self.hook_manager:
+                    self.hook_manager.emit("PostToolUse", {
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "result": error_text,
+                        "error": True,
+                    })
+                tool_messages.append(ToolMessage(
+                    content=error_text,
+                    tool_call_id=tool_call["id"],
+                ))
+                return
+            elif user_input == "s":
+                skip_text = "[权限] 用户跳过了此操作"
+                if self.hook_manager:
+                    self.hook_manager.emit("PostToolUse", {
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "result": skip_text,
+                        "error": True,
+                    })
+                tool_messages.append(ToolMessage(
+                    content=skip_text,
+                    tool_call_id=tool_call["id"],
+                ))
+                return
+            # y 或其他 → 继续执行
+
+        # flush 渲染缓冲区，避免审批面板与流式输出混淆
+        if self.hook_manager:
+            self.hook_manager.emit("BeforeToolExecution", {})
+
+        # PreToolUse Hook
+        if self.hook_manager:
+            self.hook_manager.emit("PreToolUse", {
+                "tool": tool_name,
+                "args": tool_args,
+            })
+
+        # 执行工具
+        had_error = False
+        tool = self.tool_registry.get(tool_name)
+        if tool:
+            try:
+                self._check_cancelled()
+                result = tool.invoke(tool_args)
+                self._check_cancelled()
+                self._tool_failure_counts[tool_name] = 0
+            except AgentCancelledError:
+                raise
+            except Exception as e:
                 had_error = True
-                result = f"工具 {tool_name} 不存在"
-                self._record_tool_failure(tool_name, result)
+                self._record_tool_failure(tool_name, str(e))
+                result = f"工具执行错误: {e}"
+                disabled_reason = self._disabled_tools.get(tool_name)
+                if disabled_reason:
+                    result = f"{result}\n{disabled_reason}"
                 if self.hook_manager:
                     self.hook_manager.emit("PostToolUse", {
                         "tool": tool_name,
@@ -1114,40 +1346,49 @@ class AgentLoop:
                         "result": str(result)[:500],
                         "error": True,
                     })
-
-            # PostToolUse Hook
-            if self.hook_manager and not had_error:
+        else:
+            had_error = True
+            result = f"工具 {tool_name} 不存在"
+            self._record_tool_failure(tool_name, result)
+            if self.hook_manager:
                 self.hook_manager.emit("PostToolUse", {
                     "tool": tool_name,
                     "args": tool_args,
                     "result": str(result)[:500],
+                    "error": True,
                 })
 
-            # browser_connect/browser_disconnect 执行后刷新工具列表
-            if not had_error and tool_name in ("browser_connect", "browser_disconnect") and self.mcp_manager:
-                self._refresh_tools_after_browser_switch()
+        # PostToolUse Hook
+        if self.hook_manager and not had_error:
+            self.hook_manager.emit("PostToolUse", {
+                "tool": tool_name,
+                "args": tool_args,
+                "result": str(result)[:500],
+            })
 
-            from langchain_core.messages import ToolMessage
-            tool_messages.append(ToolMessage(
-                content=str(result),
-                tool_call_id=tool_call["id"],
-                name=tool_name,
-            ))
+        # browser_connect/browser_disconnect 执行后刷新工具列表
+        if not had_error and tool_name in ("browser_connect", "browser_disconnect") and self.mcp_manager:
+            self._refresh_tools_after_browser_switch()
 
-            # MCP / Chrome 工具返回图片时，把图片作为 user message 注入
-            # tool role 不支持 content array，必须用 user message 承载图片
-            image_parts = getattr(result, "image_parts", None)
-            if image_parts:
-                image_content = [
-                    {
-                        "type": "text",
-                        "text": f"工具 {tool_name} 返回了图片内容，请结合上面的工具文本结果分析。",
-                    }
-                ]
-                image_content.extend(parts_to_openai(image_parts))
-                tool_messages.append(HumanMessage(content=image_content))
+        tool_messages.append(ToolMessage(
+            content=str(result),
+            tool_call_id=tool_call["id"],
+            name=tool_name,
+        ))
 
-        return {"messages": tool_messages}
+        # MCP / Chrome 工具返回图片时，把图片作为 user message 注入
+        # tool role 不支持 content array，必须用 user message 承载图片
+        # 注意：中断恢复回放时只恢复 ToolMessage 文本，图片不重复注入
+        image_parts = getattr(result, "image_parts", None)
+        if image_parts:
+            image_content = [
+                {
+                    "type": "text",
+                    "text": f"工具 {tool_name} 返回了图片内容，请结合上面的工具文本结果分析。",
+                }
+            ]
+            image_content.extend(parts_to_openai(image_parts))
+            tool_messages.append(HumanMessage(content=image_content))
 
     def _refresh_tools_after_browser_switch(self):
         """browser_connect/browser_disconnect 执行后刷新 AgentLoop 的工具列表。
@@ -1156,9 +1397,18 @@ class AgentLoop:
         此方法重建 LLM 绑定的工具列表，使下一轮 think 能使用新工具。
         """
         try:
-            self.tools = self._filter_available_tools(
+            self._all_available_tools = self._filter_available_tools(
                 self.tool_registry.get_langchain_tools()
             )
+            # 切到 shared 模式说明浏览器任务已激活，直接挂载 chrome 工具
+            mcp = self.mcp_manager
+            if (
+                mcp
+                and getattr(mcp, "_chrome_server_name", None)
+                and mcp.get_chrome_mode() == "shared"
+            ):
+                self._browser_tools_mounted = True
+            self.tools = self._apply_browser_tool_filter(self._all_available_tools)
             self.llm_with_tools = self.llm.bind_tools(self.tools)
             self._tool_map = {t.name: t for t in self.tools}
             logger.info("浏览器模式切换后工具列表已刷新，当前 %d 个工具可用", len(self.tools))
@@ -1260,6 +1510,44 @@ class AgentLoop:
 
     # ── 公共接口 ──────────────────────────────────────────
 
+    def _stream_checkpointed(self, graph_input, thread_id: str):
+        """带 checkpoint thread 标记生命周期的 graph.stream 包装。
+
+        - 运行开始写入 active 标记（崩溃后可凭 thread_id 定位最近 checkpoint）
+        - 正常结束 / 用户主动中断 → 清除标记
+        - 意外异常 → 保留标记，供 resume() 续跑
+        """
+        provider = self.checkpointer_provider
+        provider.mark_active(thread_id)
+        # 供 _act 的 tool_call 级执行记录定位（act:{thread_id} 作用域）
+        self._current_thread_id = thread_id
+        config = {
+            "recursion_limit": 100,
+            "configurable": {"thread_id": thread_id},
+        }
+        try:
+            for event in self.graph.stream(graph_input, config=config):
+                self._check_cancelled()
+                yield event
+        except (AgentCancelledError, KeyboardInterrupt, GeneratorExit):
+            # 用户主动中断：不作为可恢复任务保留
+            provider.clear_active()
+            raise
+        except BaseException:
+            # 意外中断：保留 active 标记
+            raise
+        else:
+            provider.clear_active()
+        finally:
+            self._current_thread_id = None
+
+    def _stream_plain(self, initial_state):
+        """无 checkpoint 的原始执行路径（行为与改造前完全一致）。"""
+        config = {"recursion_limit": 100}
+        for event in self.graph.stream(initial_state, config=config):
+            self._check_cancelled()
+            yield event
+
     def stream(self, user_input: str):
         """流式执行 Agent 循环，yield 每步状态。"""
         self._reset_runtime_state()
@@ -1269,10 +1557,11 @@ class AgentLoop:
             "plan": None,
         }
 
-        config = {"recursion_limit": 100}
-        for event in self.graph.stream(initial_state, config=config):
-            self._check_cancelled()
-            yield event
+        if getattr(self, "checkpointer_provider", None) is not None:
+            thread_id = self.checkpointer_provider.new_thread_id()
+            yield from self._stream_checkpointed(initial_state, thread_id)
+            return
+        yield from self._stream_plain(initial_state)
 
     def stream_with_history(self, conversation: list):
         """流式执行 Agent 循环，传入完整对话历史。"""
@@ -1288,10 +1577,40 @@ class AgentLoop:
             "plan": None,
         }
 
-        config = {"recursion_limit": 100}
-        for event in self.graph.stream(initial_state, config=config):
-            self._check_cancelled()
-            yield event
+        if getattr(self, "checkpointer_provider", None) is not None:
+            thread_id = self.checkpointer_provider.new_thread_id()
+            yield from self._stream_checkpointed(initial_state, thread_id)
+            return
+        yield from self._stream_plain(initial_state)
+
+    def resume(self, thread_id: Optional[str] = None):
+        """从最近 checkpoint 恢复上次意外中断的运行。
+
+        thread_id 为空时读取 provider 的 active 标记。
+        LangGraph 会从中断前最后一个 super-step 边界的状态继续执行；
+        plan 节点内部已完成任务由 TaskRecordStore 跳过，避免重复副作用。
+        """
+        provider = self.checkpointer_provider
+        if provider is None:
+            raise RuntimeError("未启用 checkpoint，无法恢复中断任务")
+        thread_id = thread_id or provider.active_thread()
+        if not thread_id:
+            raise RuntimeError("没有可恢复的中断任务")
+
+        self._reset_runtime_state()
+        self._check_cancelled()
+        logger.info("从中断点恢复执行: thread_id=%s", thread_id)
+        yield from self._stream_checkpointed(None, thread_id)
+
+    def get_thread_messages(self, thread_id: str) -> list:
+        """读取指定 thread 最近 checkpoint 中的消息（用于恢复后同步会话历史）。"""
+        if self.checkpointer_provider is None:
+            return []
+        config = {"configurable": {"thread_id": thread_id}}
+        state = self.graph.get_state(config)
+        if not state or not state.values:
+            return []
+        return list(state.values.get("messages", []))
 
     def invoke(self, user_input: str) -> dict:
         """同步执行 Agent 循环，返回最终状态。"""
@@ -1301,6 +1620,27 @@ class AgentLoop:
             "messages": [HumanMessage(content=user_input)],
             "plan": None,
         }
+
+        provider = getattr(self, "checkpointer_provider", None)
+        if provider is not None:
+            thread_id = provider.new_thread_id()
+            provider.mark_active(thread_id)
+            self._current_thread_id = thread_id
+            try:
+                result = self.graph.invoke(initial_state, config={
+                    "recursion_limit": 100,
+                    "configurable": {"thread_id": thread_id},
+                })
+            except (AgentCancelledError, KeyboardInterrupt):
+                provider.clear_active()
+                raise
+            except BaseException:
+                raise
+            else:
+                provider.clear_active()
+            finally:
+                self._current_thread_id = None
+            return result
 
         config = {"recursion_limit": 100}
         return self.graph.invoke(initial_state, config=config)
@@ -1322,7 +1662,11 @@ class AgentLoop:
                 SystemMessage(content=COMPLEXITY_PROMPT),
                 HumanMessage(content=user_input),
             ]
-            response = classifier_llm.invoke(messages)
+            from core.llm_retry import call_with_retry
+            response = call_with_retry(
+                lambda: classifier_llm.invoke(messages),
+                description="复杂度分类",
+            )
             text = response.content.strip().lower()
             if "complex" in text:
                 return "complex"
@@ -1348,12 +1692,14 @@ class AgentLoop:
         if self.hook_manager:
             self.hook_manager.emit("TeamModeStart", {"goal": user_input})
 
+        provider = getattr(self, "checkpointer_provider", None)
         orchestrator = MultiAgentOrchestrator(
             llm=self.llm,
             tool_registry=self.tool_registry,
             permission_policy=self.permission_policy,
             hook_manager=self.hook_manager,
             memory=self.memory,
+            checkpointer=provider.saver if provider else None,
         )
         result = orchestrator.run(user_input)
 

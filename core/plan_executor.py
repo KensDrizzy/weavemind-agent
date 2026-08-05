@@ -36,12 +36,14 @@ class PlanExecutor:
         hook_manager: Optional[HookManager] = None,
         max_parallel: int = 4,
         cancellation_token: Optional[CancellationToken] = None,
+        task_store=None,
     ):
         self.tool_registry = tool_registry
         self.permission_policy = permission_policy
         self.hook_manager = hook_manager
         self.max_parallel = max_parallel
         self.cancellation_token = cancellation_token
+        self.task_store = task_store
         # 兼容规划器生成的常见参数别名（如 file_path -> path）
         self.arg_aliases = {
             "path": {"file_path", "filepath", "file", "target_path"},
@@ -113,6 +115,16 @@ class PlanExecutor:
         task.mark_started()
         logger.info(f"执行任务 {task.id}: {task.description}")
 
+        # 中断恢复重入：已有完成记录的任务直接回填结果，不重复执行工具。
+        # 这是副作用幂等的兜底——LangGraph checkpoint 只到节点边界，
+        # 节点内部已完成 task 的副作用靠这里避免重复。
+        if self.task_store:
+            record = self.task_store.get(plan.id, task.id)
+            if record and record["status"] == TaskStatus.COMPLETED.value:
+                logger.info(f"任务 {task.id} 已有完成记录，跳过重复执行（中断恢复）")
+                task.mark_completed(result=record["result"] or "")
+                return
+
         try:
             # 无工具名时，由 LLM 自由执行（后续迭代支持）
             if not task.tool_name:
@@ -168,6 +180,10 @@ class PlanExecutor:
                 })
 
             task.mark_completed(result=str(result))
+            if self.task_store:
+                self.task_store.upsert(
+                    plan.id, task.id, TaskStatus.COMPLETED.value, result=str(result)
+                )
             logger.info(f"任务 {task.id} 完成")
 
         except AgentCancelledError:
@@ -175,6 +191,10 @@ class PlanExecutor:
         except Exception as e:
             logger.error(f"任务 {task.id} 执行失败: {e}")
             task.mark_failed(error=str(e))
+            if self.task_store:
+                self.task_store.upsert(
+                    plan.id, task.id, TaskStatus.FAILED.value, error=str(e)
+                )
             self._propagate_failure(task, plan)
 
     def _check_cancelled(self):
