@@ -96,10 +96,11 @@ rag:
   force_search_code: true
   chroma_dir: .weavemind/chroma
   keyword_db: .weavemind/rag/keyword_index.db
-  chunk_size: 500
-  chunk_overlap: 100
+  chunk_size: 500          # 超预算结构块的二次切分长度（字符）
+  chunk_overlap: 100       # 二次切分重叠长度（字符）
   embedding:
     provider: openai
+    max_input_bytes: 8000  # 单文档 UTF-8 字节预算，非精确 token 数；按模型限制调整
     model: text-embedding-v3
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key_env: DASHSCOPE_API_KEY

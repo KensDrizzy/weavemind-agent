@@ -25,6 +25,7 @@ from rag.chunkers import (
     should_index_file,
     should_index_dir,
     CODE_EXTENSIONS,
+    split_oversized_chunks,
 )
 from rag.keyword_index import KeywordIndex
 from rag.retrieval_enhancements import QueryRewriter, ResultReranker, SearchCache
@@ -118,18 +119,20 @@ class CodeRAGPipeline:
             return 0
 
         try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             logger.warning(f"读取文件失败: {file_path}: {e}")
             return 0
 
         # 分块
         chunker = get_chunker_for_file(file_path)
-        chunks = chunker.chunk(file_path, content)
-
-        if not chunks:
-            return 0
+        chunks = split_oversized_chunks(
+            chunker.chunk(file_path, content),
+            chunk_size=settings.get("rag.chunk_size", 500),
+            chunk_overlap=settings.get("rag.chunk_overlap", 100),
+            max_input_bytes=settings.get("rag.embedding.max_input_bytes", 8000),
+        )
 
         # 给每个 chunk 打上 source 标签和索引时间
         if source:
@@ -139,11 +142,21 @@ class CodeRAGPipeline:
         for chunk in chunks:
             chunk.indexed_at = now
 
-        # 写入向量存储
-        self._add_to_vector_store(chunks)
-
-        # 写入关键词索引
-        self.keyword_index.add_chunks(chunks)
+        # 只有两套索引都写入成功，才允许增量索引跳过该文件。
+        try:
+            if not chunks:
+                self._remove_file_vectors(file_path)
+            self._add_to_vector_store(chunks)
+            self.keyword_index.add_chunks(chunks)
+        except Exception:
+            self._indexed_files[cache_key] = {
+                **self._indexed_files.get(cache_key, {}),
+                "index_complete": False,
+                "source": source,
+            }
+            self._save_metadata()
+            self._clear_search_cache()
+            raise
 
         # 更新元数据
         self._indexed_files[cache_key] = {
@@ -151,6 +164,8 @@ class CodeRAGPipeline:
             "timestamp": time.time(),
             "chunks": len(chunks),
             "source": source,
+            "index_complete": True,
+            "index_version": self._index_version(),
         }
         self._save_metadata()
         self._clear_search_cache()
@@ -617,12 +632,25 @@ class CodeRAGPipeline:
             return ""
         return h.hexdigest()
 
+    @staticmethod
+    def _index_version() -> str:
+        """旧版本与分块配置变化均需重建，修复曾被误标成功的向量索引。"""
+        return "bounded-v1:" + json.dumps([
+            settings.get("rag.chunk_size", 500),
+            settings.get("rag.chunk_overlap", 100),
+            settings.get("rag.embedding.max_input_bytes", 8000),
+        ])
+
     def _is_file_unchanged(self, file_path: str, file_hash: str) -> bool:
         """检查文件是否未变更。"""
         meta = self._indexed_files.get(file_path)
         if not meta:
             return False
-        return meta.get("hash") == file_hash
+        return (
+            meta.get("hash") == file_hash
+            and meta.get("index_complete") is True
+            and meta.get("index_version") == self._index_version()
+        )
 
     def _add_to_vector_store(self, chunks: List[CodeChunk]):
         """将代码块添加到 Chroma 向量存储。"""
@@ -645,17 +673,13 @@ class CodeRAGPipeline:
         if not docs:
             return
 
-        # 先删除同文件的旧文档
-        file_path = chunks[0].file_path if chunks else ""
-        try:
-            existing = self.vector_store.get(where={"file_path": file_path})
-            if existing and existing["ids"]:
-                self.vector_store.delete(ids=existing["ids"])
-        except Exception:
-            pass
+        # 写入成功后再删除过期 ID，接口失败时不提前清空旧向量。
+        file_path = chunks[0].file_path
+        existing = self.vector_store.get(where={"file_path": file_path})
+        old_ids = set(existing["ids"] if existing else [])
 
-        # 分批写入，DashScope text-embedding-v4 限制每批最多 10 个文档
-        batch_size = min(settings.get("rag.embedding.batch_size", 10), 10)
+        batch_size = max(1, min(settings.get("rag.embedding.batch_size", 10), 10))
+        failed_ids = []
         total_batches = (len(docs) + batch_size - 1) // batch_size
         for i in range(0, len(docs), batch_size):
             batch_docs = docs[i : i + batch_size]
@@ -668,12 +692,19 @@ class CodeRAGPipeline:
                 logger.warning(
                     f"向量写入批次 {batch_num}/{total_batches} 失败（{len(batch_docs)} 文档）: {e}"
                 )
-                # 逐条重试，跳过有问题的文档
+                # 逐条重试隔离失败文档，仍失败则让该文件下次继续补建。
                 for doc, doc_id in zip(batch_docs, batch_ids):
                     try:
                         self.vector_store.add_documents([doc], ids=[doc_id])
                     except Exception as e2:
-                        logger.warning(f"跳过文档 {doc_id}: {e2}")
+                        failed_ids.append(doc_id)
+                        logger.warning(f"文档 {doc_id} 写入失败，保留待重试状态: {e2}")
+
+        if failed_ids:
+            raise RuntimeError(f"向量索引写入失败：{len(failed_ids)}/{len(docs)} 个文档，文件 {file_path}")
+        obsolete_ids = old_ids - set(ids)
+        if obsolete_ids:
+            self.vector_store.delete(ids=sorted(obsolete_ids))
 
     def _load_metadata(self):
         """从磁盘加载索引元数据。"""
@@ -805,6 +836,14 @@ class CodeRAGPipeline:
                 deleted.append(cache_key)
                 continue
 
+            # 被排除的旧条目按删除处理；历史假成功和失败文件不能走 mtime 快筛。
+            if not should_index_file(file_path):
+                deleted.append(cache_key)
+                continue
+            if meta.get("index_complete") is not True or meta.get("index_version") != self._index_version():
+                stale.append(cache_key)
+                continue
+
             # 第二步：mtime 快筛 — 修改时间没变则一定没变
             indexed_ts = meta.get("timestamp", 0)
             try:
@@ -891,9 +930,11 @@ class CodeRAGPipeline:
                 logger.debug(f"清理向量: {file_path} ({len(existing['ids'])} 条)")
         except Exception as e:
             logger.warning(f"清理向量失败: {file_path}: {e}")
+            raise
 
         # 同时清理关键词索引
         try:
             self.keyword_index.delete_by_file(file_path)
         except Exception as e:
             logger.warning(f"清理关键词索引失败: {file_path}: {e}")
+            raise

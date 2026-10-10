@@ -104,7 +104,8 @@ WeaveMindCLI (cli/app.py) — 顶层编排器 + REPL
 ### RAG（rag/）
 
 - **索引**：`PythonASTChunker` 按 import 区 / 类概览（类声明+前 5 行，方法单独成块）/ 方法 / 函数分块，提取 signature 与 docstring；语法错误回退行级 `FallbackChunker`。双索引写入：Chroma 向量（分批 ≤10 条，逐条重试容错）+ SQLite FTS5（`unicode61` 分词，`bm25()` 排序）。
-- **增量同步**：索引时按 MD5 跳过未变更文件；检索前 `sync_before_search` 做 mtime 快筛 + MD5 精确确认两级检测，处理变更重索引/删除清理/新增补索引。
+- **索引保护**：排除 `.DS_Store`、AppleDouble 文件、二进制/非 UTF-8 文件及 `.firecrawl` 缓存。保留正常 AST/行级块，超出 `rag.embedding.max_input_bytes`（默认 8000 UTF-8 字节）时按 `rag.chunk_size` / `rag.chunk_overlap` 二次切分；字节预算不是精确 token 数，须按实际模型限制调整。向兼容端点仍发送原始字符串，不发送 OpenAI token ID。
+- **增量同步**：仅当双索引写入成功、索引版本一致且 MD5 未变时跳过文件；检索前 `sync_before_search` 先处理旧版本/失败条目和新增过滤规则，再做 mtime 快筛 + MD5 精确确认。失败条目下次补建，旧版本首次同步会重建有效文件并清理无效文件（会产生 Embedding 调用）；写入成功后才清理过期向量 ID，不提前清空旧向量。
 - **检索链路**：`QueryRewriter`（规则路：标识符拆分 + 中文意图词→英文代码词同义表；auto 模式对指代型问题升级 LLM 改写，并用 FTS 真实符号提示约束防编造）→ 双路召回 → 混合融合（`semantic×0.5 + keyword×0.3 + 类型加成 + 双命中奖励 0.1`，同文件 ≤2 条）→ `ResultReranker`（heuristic / cross_encoder / llm 可配，失败回退 heuristic）→ `SearchCache`（TTL+LRU，缓存键含索引指纹，索引变更自动失效）。
 - **接入主循环**：`rag.force_search_code: true` 时，`AgentLoop._maybe_force_search_code` 对代码库实现类问题在首次 LLM 调用前强制构造 SearchCode tool_call；`_act` 自动为 SearchCode 补 `chat_history` 以支持指代消解。
 
