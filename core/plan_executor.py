@@ -6,6 +6,7 @@
 import asyncio
 import inspect
 import logging
+from contextvars import copy_context
 from typing import Optional
 
 from core.plan_models import Plan, Task, TaskStatus, PlanStatus
@@ -13,6 +14,7 @@ from tools.registry import ToolRegistry
 from permissions.policy import PermissionPolicy
 from hooks.manager import HookManager
 from core.cancellation import AgentCancelledError, CancellationToken
+from core.run_trace import traced_task, record_event
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +109,9 @@ class PlanExecutor:
     async def _execute_task_async(self, task: Task, plan: Plan):
         """异步执行单个任务。"""
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._execute_task, task, plan)
+        await loop.run_in_executor(None, copy_context().run, self._execute_task, task, plan)
 
+    @traced_task
     def _execute_task(self, task: Task, plan: Plan):
         """执行单个任务：权限检查 → Hook → 工具调用 → Hook → 更新状态。"""
         self._check_cancelled()
@@ -121,6 +124,7 @@ class PlanExecutor:
         if self.task_store:
             record = self.task_store.get(plan.id, task.id)
             if record and record["status"] == TaskStatus.COMPLETED.value:
+                record_event("task.replayed", plan_id=plan.id, task_id=task.id)
                 logger.info(f"任务 {task.id} 已有完成记录，跳过重复执行（中断恢复）")
                 task.mark_completed(result=record["result"] or "")
                 return
@@ -278,6 +282,8 @@ class PlanExecutor:
         for task in plan.tasks:
             if task.status == TaskStatus.PENDING and failed_id in task.dependencies:
                 task.mark_skipped(reason=f"依赖任务 {failed_id} 失败")
+                record_event("task.skipped", plan_id=plan.id, task_id=task.id,
+                             dependency=failed_id, error=task.error)
                 # 递归传播
                 self._propagate_failure(task, plan)
 
@@ -286,6 +292,7 @@ class PlanExecutor:
         for task in plan.tasks:
             if task.status == TaskStatus.PENDING:
                 task.mark_skipped(reason="不可达任务（可能依赖失败任务）")
+                record_event("task.skipped", plan_id=plan.id, task_id=task.id, error=task.error)
 
     def _finalize_plan(self, plan: Plan):
         """根据任务执行结果确定计划最终状态。"""

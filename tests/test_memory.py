@@ -5,8 +5,8 @@ import json
 from core.memory import LongTermMemory, MemoryEntry
 
 
-def test_long_term_memory_updates_highly_similar_fact(tmp_path):
-    """相似度超过阈值时，新记忆应替换旧记忆而不是新增。"""
+def test_long_term_memory_add_only_keeps_old_fact(tmp_path):
+    """ADD-only 写入：相似内容也保留为新条目，不覆盖旧记忆。"""
     memory = LongTermMemory(str(tmp_path / "long_term.json"))
 
     old_content = "用户偏好使用 JDK 17。请优先使用 Maven。"
@@ -18,12 +18,21 @@ def test_long_term_memory_updates_highly_similar_fact(tmp_path):
     assert memory.store(new_content, metadata={"source": "test"}) is True
 
     entries = memory.get_all()
-    assert len(entries) == 1
-    assert entries[0].id == original_entry.id
-    assert entries[0].content == new_content
-    assert entries[0].metadata["updated_from"] == old_content
-    assert entries[0].metadata["update_similarity"] > 0.85
-    assert entries[0].metadata["source"] == "test"
+    assert len(entries) == 2
+    contents = {e.content for e in entries}
+    assert old_content in contents
+    assert new_content in contents
+    # 原始条目未被修改
+    orig = next(e for e in entries if e.content == old_content)
+    assert orig.id == original_entry.id
+
+
+def test_long_term_memory_exact_duplicate_deduplicated(tmp_path):
+    """完全相同的内容仍按 MD5 去重。"""
+    memory = LongTermMemory(str(tmp_path / "long_term.json"))
+    assert memory.store("用户偏好使用 JDK 17") is True
+    assert memory.store("用户偏好使用 JDK 17") is False
+    assert len(memory.get_all()) == 1
 
 
 def test_long_term_memory_keeps_distinct_fact(tmp_path):
@@ -88,3 +97,16 @@ def test_importance_multiplier_boosts_ranking(tmp_path):
     results = memory.search("Chroma")
     assert len(results) >= 2
     assert "关键" in results[0].content
+
+
+def test_semantic_search_via_vector_fusion(tmp_path):
+    """向量信号应让语义相近但表述不同的 query 也能命中正确记忆。"""
+    memory = LongTermMemory(str(tmp_path / "long_term.json"))
+    # 存一条关于数据库的记忆
+    memory.store("项目使用 PostgreSQL 存储用户数据")
+    memory.store("前端框架选择 Vue 3")
+
+    # 用不同表述查询：语义相关但 bigram 重叠很低
+    results = memory.search("关系型数据库选型")
+    assert len(results) >= 1
+    assert any("PostgreSQL" in e.content for e in results)

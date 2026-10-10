@@ -352,6 +352,39 @@ Chrome DevTools 支持两种模式：
 
 ## 开发与测试
 
+### Agent 运行复盘
+
+每次 ReAct、Plan 或 Team 图运行默认生成本地轨迹 `.weavemind/traces/<run_id>.jsonl`。
+记录模型/工具调用的父子关联、耗时、可用 token 统计、工具结果摘要、计划任务状态和结束原因。
+无需外部 Trace 平台；`config.yaml` 中可通过 `trace.enabled: false` 关闭，
+`trace.directory` 修改目录，`trace.max_events` 调整每轮事件上限（默认 2000）。
+不自动清理历史文件，需要时可自行清理该目录。
+
+重启 CLI（使新增工具生效）后，可以直接说：
+
+> 刚才 Agent 为什么一直调工具却没完成任务？用 agent-run-diagnosis 复盘，并引用事件证据。
+
+内置 Skill 调用只读工具 `DiagnoseRun`，自动选择当前会话此前最近一次非诊断运行。
+`action="list"` 列出当前会话运行，`run_id` 可指定完整 ID。也可以离线执行：
+
+```bash
+.venv/bin/python skills/builtin/agent-run-diagnosis/scripts/diagnose.py --list
+.venv/bin/python skills/builtin/agent-run-diagnosis/scripts/diagnose.py --run-id <完整ID>
+.venv/bin/python skills/builtin/agent-run-diagnosis/scripts/diagnose.py --run-id <完整ID> --format json
+```
+
+脚本的 `latest` 默认选择整个工作区的最近一次非诊断运行，可用 `--session-id` 限定。
+诊断给出检索、工具、规划和收尾问题的候选及 `#seq` 证据，重复调用只算线索，
+不会自动重跑任务，也不会将“工具返回”或“图执行结束”当作任务验收成功。
+采集启用前的历史运行无法补录；缺少结束事件、摘要截断和事件上限会在报告中注明。
+CLI 快捷操作、图执行前的复杂度分类不在轨迹范围内。
+
+轨迹文件仅保存在本地，使用 `0600` 权限，屏蔽常见凭证并限制摘要长度，
+不记录模型思维或图片载荷；业务文本仍可能出现在摘要中，不应直接公开。
+微信通道运行也会采集，但远程安全工具白名单默认不开放 `DiagnoseRun`。
+
+### 测试命令
+
 ```bash
 source .venv/bin/activate
 python -m pytest

@@ -40,6 +40,7 @@ from core.multimodal.model_capabilities import (
 from core.plan_models import Plan
 from core.planner import Planner
 from core.plan_executor import PlanExecutor
+from core.run_trace import traced_stream, traced_invoke, trace_config, stop_trace, record_event
 from hooks.manager import HookManager
 from permissions.policy import PermissionPolicy
 from tools.registry import ToolRegistry
@@ -1005,12 +1006,15 @@ class AgentLoop:
         # 硬性迭代上限
         if self._model_call_count >= MAX_ITERATIONS:
             logger.warning("达到最大迭代次数 %d，强制结束", MAX_ITERATIONS)
+            stop_trace("iteration_limit")
             return "end"
         # 浏览器工具重复检测（防止无限滚动/截图循环）
         if self._detect_browser_loop(state["messages"]):
+            stop_trace("browser_loop")
             return "end"
         # 通用停滞检测（同一工具签名连续重复调用）
         if self._detect_stagnation(state["messages"]):
+            stop_trace("stagnation")
             return "end"
         # 普通模式：有 tool_calls 则继续
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
@@ -1099,6 +1103,8 @@ class AgentLoop:
             if record_key:
                 record = self.task_store.get(*record_key)
                 if record and record["status"] == "completed":
+                    record_event("tool.replayed", tool=tool_call["name"], tool_call_id=tool_call["id"],
+                                 record_scope=record_key[0])
                     logger.info(
                         "tool_call %s (%s) 已有执行记录，回放结果（中断恢复）",
                         tool_call["id"], tool_call["name"],
@@ -1526,7 +1532,7 @@ class AgentLoop:
             "configurable": {"thread_id": thread_id},
         }
         try:
-            for event in self.graph.stream(graph_input, config=config):
+            for event in self.graph.stream(graph_input, config=trace_config(config)):
                 self._check_cancelled()
                 yield event
         except (AgentCancelledError, KeyboardInterrupt, GeneratorExit):
@@ -1544,10 +1550,11 @@ class AgentLoop:
     def _stream_plain(self, initial_state):
         """无 checkpoint 的原始执行路径（行为与改造前完全一致）。"""
         config = {"recursion_limit": 100}
-        for event in self.graph.stream(initial_state, config=config):
+        for event in self.graph.stream(initial_state, config=trace_config(config)):
             self._check_cancelled()
             yield event
 
+    @traced_stream()
     def stream(self, user_input: str):
         """流式执行 Agent 循环，yield 每步状态。"""
         self._reset_runtime_state()
@@ -1563,6 +1570,7 @@ class AgentLoop:
             return
         yield from self._stream_plain(initial_state)
 
+    @traced_stream()
     def stream_with_history(self, conversation: list):
         """流式执行 Agent 循环，传入完整对话历史。"""
         self._reset_runtime_state()
@@ -1583,6 +1591,7 @@ class AgentLoop:
             return
         yield from self._stream_plain(initial_state)
 
+    @traced_stream("resume")
     def resume(self, thread_id: Optional[str] = None):
         """从最近 checkpoint 恢复上次意外中断的运行。
 
@@ -1612,6 +1621,7 @@ class AgentLoop:
             return []
         return list(state.values.get("messages", []))
 
+    @traced_invoke()
     def invoke(self, user_input: str) -> dict:
         """同步执行 Agent 循环，返回最终状态。"""
         self._reset_runtime_state()
@@ -1627,10 +1637,10 @@ class AgentLoop:
             provider.mark_active(thread_id)
             self._current_thread_id = thread_id
             try:
-                result = self.graph.invoke(initial_state, config={
+                result = self.graph.invoke(initial_state, config=trace_config({
                     "recursion_limit": 100,
                     "configurable": {"thread_id": thread_id},
-                })
+                }))
             except (AgentCancelledError, KeyboardInterrupt):
                 provider.clear_active()
                 raise
@@ -1643,7 +1653,7 @@ class AgentLoop:
             return result
 
         config = {"recursion_limit": 100}
-        return self.graph.invoke(initial_state, config=config)
+        return self.graph.invoke(initial_state, config=trace_config(config))
 
     def classify_complexity(self, user_input: str) -> str:
         """用 LLM 判断任务复杂度。

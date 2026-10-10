@@ -592,6 +592,7 @@ class WeaveMindCLI:
 
         try:
             # 使用对话历史调用 Agent
+            self.agent_loop.trace_session_id = getattr(self, "session_id", None)
             final_ai_message = self._consume_agent_events(
                 self.agent_loop.stream_with_history(self.conversation)
             )
@@ -800,6 +801,7 @@ class WeaveMindCLI:
             )
 
             latest_step_results = {}
+            orchestrator.trace_session_id = getattr(self, "session_id", None)
             latest_messages = []
 
             for event in orchestrator.stream(user_input):

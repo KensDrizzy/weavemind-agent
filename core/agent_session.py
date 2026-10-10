@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -38,6 +39,7 @@ class AgentSession:
         max_messages: int = 40,
     ):
         self.agent_loop = agent_loop
+        self.agent_loop.trace_session_id = uuid.uuid4().hex
         self.cancellation_token = cancellation_token or CancellationToken()
         self.max_messages = max_messages
         self.conversation: list[BaseMessage] = []

@@ -36,6 +36,8 @@ class KnowledgeRAGPipeline:
         )
         self.reranker = KnowledgeReranker()
 
+        # Vector Store：语义检索用，默认 SQLite，可切换到 Milvus。
+        # Keyword Store：关键词检索用，目前固定 SQLite + FTS5。
         self.vector_store = self._create_vector_store()
         # Keyword search remains SQLite FTS5 for now; it is cheap and good enough.
         db_path = settings.get("knowledge_rag.sqlite_db", os.path.join(root_dir, "knowledge.db"))

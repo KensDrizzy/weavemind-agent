@@ -11,6 +11,7 @@
 
 import json
 import logging
+from core.run_trace import traced_stream, traced_invoke, trace_config
 import os
 import re
 from typing import Literal, Optional
@@ -387,6 +388,8 @@ class MultiAgentOrchestrator:
         aliases = {repo_name}
         if repo_name.endswith("-agent"):
             aliases.add(repo_name[:-6])
+        elif repo_name.endswith("agent"):
+            aliases.add(repo_name[:-5])
         return tuple(alias for alias in aliases if alias)
 
     def _is_local_code_task(self, user_input: str) -> bool:
@@ -456,6 +459,7 @@ class MultiAgentOrchestrator:
 
         return planner_node
 
+    @traced_invoke("team")
     def run(self, user_input: str) -> dict:
         """执行 Multi-Agent 协作。
 
@@ -477,9 +481,10 @@ class MultiAgentOrchestrator:
         }
         config = {"recursion_limit": MAX_SUPERVISOR_ROUNDS * 5}
         config.update(self._checkpoint_config())
-        result = self.graph.invoke(initial_state, config=config)
+        result = self.graph.invoke(initial_state, config=trace_config(config))
         return result
 
+    @traced_stream("team")
     def stream(self, user_input: str):
         """流式执行 Multi-Agent 协作，yield 每步状态。"""
         self._configure_graph_for_task(user_input)
@@ -494,7 +499,7 @@ class MultiAgentOrchestrator:
         }
         config = {"recursion_limit": MAX_SUPERVISOR_ROUNDS * 5}
         config.update(self._checkpoint_config())
-        for event in self.graph.stream(initial_state, config=config):
+        for event in self.graph.stream(initial_state, config=trace_config(config)):
             yield event
 
     def _checkpoint_config(self) -> dict:

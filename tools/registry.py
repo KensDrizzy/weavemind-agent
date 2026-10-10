@@ -12,6 +12,7 @@ from tools.builtin.grep import GrepTool
 from tools.builtin.web_search import WebSearchTool
 from tools.builtin.web_fetch import WebFetchTool
 from tools.builtin.ask_user import AskUserTool
+from tools.builtin.diagnosis_tools import DiagnoseRunTool
 from tools.builtin.memory_tools import MemoryAddTool, MemorySearchTool, CoreMemoryEditTool
 from tools.builtin.rag_tools import SearchCodeTool, IndexWorkspaceTool
 from tools.builtin.knowledge_tools import (
@@ -74,6 +75,7 @@ class ToolRegistry:
             ReadTool(), GlobTool(), GrepTool(),
             WebFetchTool(), WebSearchTool(),
             AskUserTool(),
+            DiagnoseRunTool(),
         ])
         # 修改类工具
         tools_list.extend([

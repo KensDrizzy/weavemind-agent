@@ -40,6 +40,8 @@ class LoadSkillTool(WeaveMindTool):
          # 截断保护：超过 5KB 就截断
         if len(body) > MAX_BODY_SIZE:
             body = body[:MAX_BODY_SIZE] + "\n...(已截断，完整内容请用 /skill show " + name + ")"
+        if skill.skill_md_path:
+            body = f"资源基准目录：{skill.skill_md_path.parent.resolve()}\n相对路径均相对此目录。\n\n" + body
         # 关键操作：把 body 塞进 buffer，不是返回给 LLM
         if self._buffer:
             self._buffer.push(name, body)

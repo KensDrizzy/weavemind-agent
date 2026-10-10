@@ -17,5 +17,5 @@ class BashTool(WeaveMindTool):
         )
         out = result.stdout
         if result.returncode != 0:
-            out += f"\n[stderr]\n{result.stderr}"
+            out += f"\n[exit code: {result.returncode}]\n[stderr]\n{result.stderr}"
         return out or "(no output)"

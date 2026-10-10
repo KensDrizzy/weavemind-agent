@@ -9,11 +9,12 @@
 设计参考：
   - PaiCLI: JSON 持久化、去重、jieba 检索
   - Letta:  CoreMemory 可编辑块
-  - Mem0:   选择性记忆管道
+  - Mem0:   ADD-only 写入 + 多信号融合检索（向量 + bigram + 时间/频次）
 
 与 PaiCLI 的关键差异：
   - 不单独建 ConversationMemory 类，LangGraph 的 add_messages 已管理消息
-  - 不引入 jieba 依赖，用字符 bigram 相似度做中文模糊匹配
+  - 检索融合两路信号：字符 bigram（精确匹配） + 向量余弦（语义泛化），
+    再叠加时间衰减 / 频次奖励 / 重要度做重排序
   - 新增 CoreMemory（借鉴 Letta），PaiCLI 没有
   - 记忆类型精简为 3 种（去掉 TOOL_RESULT，工具结果在消息流中）
 """
@@ -30,6 +31,17 @@ from typing import Literal, Optional
 
 import settings
 from langchain_core.messages import SystemMessage
+
+try:
+    from knowledge_rag.embeddings.provider import (
+        EmbeddingProvider,
+        HashEmbeddingProvider,
+        create_embedding_provider,
+    )
+except ImportError:
+    EmbeddingProvider = None
+    create_embedding_provider = None
+    HashEmbeddingProvider = None
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +67,7 @@ class MemoryEntry:
     access_count: int = 0
     last_access: float = 0.0
     importance: float = 1.0
+    embedding: Optional[list[float]] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -76,17 +89,30 @@ class LongTermMemory:
     特性：
     - 启动时自动从磁盘加载
     - 内容去重（MD5 hash）
-    - 相似记忆更新（相似度 > 0.85 时替换旧内容）
+    - ADD-only 写入：不覆盖旧记忆，让时间衰减自然降权过时信息（借鉴 Mem0）
     - 每次 store 即时持久化
-    - 检索：子串匹配 + 字符 bigram 相似度 + 时间衰减
+    - 检索：bigram 精确匹配 + 向量余弦语义搜索 + 时间/频次/重要度重排
     """
-
-    UPDATE_SIMILARITY_THRESHOLD = 0.85
 
     def __init__(self, storage_path: str):
         self.storage_path = storage_path
         self._entries: dict[str, MemoryEntry] = {}  # content_hash -> entry
+        self._embedding_provider: Optional[EmbeddingProvider] = None
+        self._embeddings_ready = False
         self._load()
+
+    def _get_embedding_provider(self):
+        """懒加载 embedding provider。优先真实模型，失败回退到本地 hash。"""
+        if self._embedding_provider is not None:
+            return self._embedding_provider
+        if create_embedding_provider is None:
+            return None
+        try:
+            self._embedding_provider = create_embedding_provider()
+        except Exception as e:
+            logger.warning("初始化记忆向量 provider 失败，退化为纯 bigram 检索: %s", e)
+            self._embedding_provider = None
+        return self._embedding_provider
 
     def _load(self):
         """启动时从磁盘加载。"""
@@ -120,13 +146,12 @@ class LongTermMemory:
         entry_type: Literal["fact", "summary"] = "fact",
         metadata: dict = None,
     ) -> bool:
-        """存储一条记忆。
+        """存储一条记忆（ADD-only）。
 
-        返回 True 表示新增或更新，False 表示完全重复或内容无效。
         写入流程：
         1. 完全相同内容按 MD5 去重；
-        2. 与已有记忆相似度 > 0.85 时，视为长期记忆 update，原地替换旧内容；
-        3. 否则新增记忆。
+        2. 否则一律新增，不覆盖旧记忆。
+        过时信息由时间衰减自然降权，保留时间上下文（Mem0 设计决策）。
         """
         content = content.strip()
         if not content or len(content) < 3:
@@ -136,37 +161,6 @@ class LongTermMemory:
         if content_hash in self._entries:
             return False
 
-        similar = self._find_similar_entry(content, self.UPDATE_SIMILARITY_THRESHOLD)
-        if similar:
-            old_hash, entry, score = similar
-            old_content = entry.content
-            now = time.time()
-            merged_metadata = dict(entry.metadata or {})
-            if metadata:
-                merged_metadata.update(metadata)
-            merged_metadata.update({
-                "updated_at": now,
-                "updated_from": old_content,
-                "update_similarity": round(score, 4),
-            })
-
-            entry.content = content
-            entry.type = entry_type
-            entry.timestamp = now
-            entry.token_count = self._estimate_tokens(content)
-            entry.metadata = merged_metadata
-
-            del self._entries[old_hash]
-            self._entries[content_hash] = entry
-            self._save()
-            logger.info(
-                "长期记忆更新: similarity=%.4f, old=%s, new=%s",
-                score,
-                old_content[:50],
-                content[:50],
-            )
-            return True
-
         entry = MemoryEntry(
             id=uuid.uuid4().hex[:8],
             content=content,
@@ -175,52 +169,97 @@ class LongTermMemory:
             token_count=self._estimate_tokens(content),
             metadata=metadata or {},
         )
+        self._ensure_embedding(entry)
         self._entries[content_hash] = entry
         self._save()
         logger.info(f"长期记忆新增: {content[:50]}")
         return True
 
-    def _find_similar_entry(
-        self,
-        content: str,
-        threshold: float,
-    ) -> Optional[tuple[str, MemoryEntry, float]]:
-        """查找超过阈值的最相似记忆，用于 update 判断。"""
-        if not self._entries:
-            return None
+    def _ensure_embedding(self, entry: MemoryEntry):
+        """为单条记忆生成 embedding 向量（如果 provider 可用）。"""
+        provider = self._get_embedding_provider()
+        if provider is None:
+            return
+        try:
+            entry.embedding = provider.embed_texts([entry.content])[0]
+        except Exception as e:
+            logger.debug("记忆 embedding 生成失败（跳过）: %s", e)
 
-        content_lower = content.lower().strip()
-        best: tuple[str, MemoryEntry, float] | None = None
-        for content_hash, entry in self._entries.items():
-            score = self._bigram_similarity(content_lower, entry.content.lower().strip())
-            if score > threshold and (best is None or score > best[2]):
-                best = (content_hash, entry, score)
-        return best
+    def _ensure_embeddings_batch(self):
+        """批量补齐缺失的 embedding（启动时老数据迁移用）。"""
+        missing = [e for e in self._entries.values() if not e.embedding]
+        if not missing:
+            self._embeddings_ready = True
+            return
+        provider = self._get_embedding_provider()
+        if provider is None:
+            return
+        try:
+            vectors = provider.embed_texts([e.content for e in missing])
+            for entry, vec in zip(missing, vectors):
+                entry.embedding = vec
+            self._save()
+        except Exception as e:
+            logger.debug("批量 embedding 失败: %s", e)
+        finally:
+            self._embeddings_ready = True
+
+    def _cosine(self, a: list[float], b: list[float]) -> float:
+        """余弦相似度。任一为空返回 0。"""
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(y * y for y in b))
+        denom = norm_a * norm_b
+        return dot / denom if denom else 0.0
 
     def search(self, query: str, limit: int = 5) -> list[MemoryEntry]:
-        """检索相关记忆 — 子串匹配 + 字符 bigram 相似度 + 时间衰减 + 使用频次。
+        """检索相关记忆 — bigram 精确匹配 + 向量语义搜索，多信号融合后重排。
 
         参考 Letta archival memory：召回时回写访问统计，
-        让"被频繁使用的记忆"获得排名奖励，命中后立即持久化。
+        让"被频繁使用的记忆"获得排名奖励。检索信号融合策略：
+          - bigram Jaccard：精确匹配，便宜且离线可用
+          - 向量余弦：解决跨表述的语义泛化问题
+        两路分数取最大值融合，再叠加时间衰减 / 频次奖励 / 重要度。
         """
         if not query or not self._entries:
             return []
 
+        if not self._embeddings_ready:
+            self._ensure_embeddings_batch()
+
         query_lower = query.lower().strip()
+
+        # 查询向量（一次生成）
+        query_vec = None
+        provider = self._embedding_provider
+        if provider:
+            try:
+                query_vec = provider.embed_query(query_lower)
+            except Exception:
+                pass
+
         scored: list[tuple[float, MemoryEntry]] = []
         now = time.time()
 
         for entry in self._entries.values():
             content_lower = entry.content.lower()
-            score = 0.0
 
-            # 子串匹配（精确）
+            # ── 信号 1: bigram 精确/模糊匹配 ──
+            bigram_score = self._bigram_similarity(query_lower, content_lower)
             if query_lower in content_lower:
-                score += 2.0
+                bigram_score += 1.0  # 子串精确命中额外加分
 
-            # 字符 bigram 相似度（模糊，适合中文）
-            score += self._bigram_similarity(query_lower, content_lower)
+            # ── 信号 2: 向量余弦语义搜索 ──
+            cosine_score = 0.0
+            if query_vec and entry.embedding:
+                cosine_score = max(self._cosine(query_vec, entry.embedding), 0.0)
 
+            # 多信号融合：取两路最大值（比加权平均更鲁棒——某一路失效不影响另一路）
+            score = max(bigram_score, cosine_score)
+
+            # ── 重排序信号 ──
             # 时间衰减（7 天半衰期）
             age_hours = (now - entry.timestamp) / 3600
             decay = 0.5 ** (age_hours / 168)  # 168h = 7 days

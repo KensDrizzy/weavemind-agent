@@ -4,6 +4,7 @@ import concurrent.futures
 import logging
 import time
 import uuid
+from contextvars import copy_context
 from typing import Any, ClassVar
 
 from agents.monitor import SubAgentMonitor, SubAgentStatus
@@ -67,7 +68,7 @@ class BatchDelegateTool(WeaveMindTool):
         try:
             for index, task in enumerate(tasks):
                 task_id = f"batch-{index + 1}-{uuid.uuid4().hex[:8]}"
-                future = executor.submit(self._run_single_task, task, task_id)
+                future = executor.submit(copy_context().run, self._run_single_task, task, task_id)
                 future_map[future] = {
                     "task": task,
                     "task_id": task_id,

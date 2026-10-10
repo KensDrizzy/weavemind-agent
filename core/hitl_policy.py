@@ -34,7 +34,7 @@ _MCP_SAFE_KEYWORDS = {
 
 # 已知的内置安全工具（不在 TOOLS_REQUIRING_APPROVAL 中，且不是 MCP 工具）
 _BUILTIN_SAFE_TOOLS = {
-    "Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUser",
+    "Read", "Glob", "Grep", "WebSearch", "WebFetch", "AskUser", "DiagnoseRun",
     "MemoryAdd", "MemorySearch", "CoreMemoryEdit",
     "SearchCode", "IndexWorkspace", "SearchKnowledge", "AskKnowledge",
     "IndexKnowledge", "ListKnowledge", "ReindexKnowledge", "Task",

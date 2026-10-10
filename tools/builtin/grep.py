@@ -15,4 +15,6 @@ class GrepTool(WeaveMindTool):
             ["grep", flags, "-n", f"--include={include}", pattern, path],
             capture_output=True, text=True
         )
+        if result.returncode > 1:
+            return f"Error: grep 执行失败（退出码 {result.returncode}）：{result.stderr}"
         return result.stdout or "(no matches)"

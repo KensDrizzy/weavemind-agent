@@ -20,6 +20,8 @@ class HookManager:
     def emit(self, event: str, data: dict = None):
         """触发事件（新接口：统一 dict 传参）。"""
         payload = data or {}
+        from core.run_trace import capture_hook
+        capture_hook(event, payload)
         tool_name = payload.get("tool")
         for matcher, cb in self._hooks.get(event, []):
             if matcher != "*" and matcher != tool_name:

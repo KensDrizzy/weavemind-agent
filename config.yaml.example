@@ -36,6 +36,12 @@ session:
   storage_dir: .weavemind/sessions
   compaction_threshold: 80000
 
+# 每轮 Agent 本地执行轨迹，无需外部服务；包含脱敏后的目标、工具参数和结果摘要
+trace:
+  enabled: true
+  directory: .weavemind/traces
+  max_events: 2000
+
 # 长任务中断恢复：LangGraph checkpoint 持久化 + thread 标记 + 任务级执行记录
 checkpoint:
   enabled: true
